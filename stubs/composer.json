@@ -1,0 +1,21 @@
+{
+    "name": "hi/kafka-stubs",
+    "description": "IDE / static-analysis stubs for the hi-kafka PHP extension",
+    "type": "phpstan-extension",
+    "license": "Apache-2.0",
+    "keywords": ["kafka", "stubs", "phpstan", "psalm", "ide"],
+    "require": {
+        "php": ">=8.2"
+    },
+    "autoload": {
+        "files": []
+    },
+    "extra": {
+        "phpstan": {
+            "includes": [],
+            "stubFiles": [
+                "hi_kafka.php"
+            ]
+        }
+    }
+}
