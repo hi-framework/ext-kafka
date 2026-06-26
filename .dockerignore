@@ -1,0 +1,9 @@
+target/
+**/*.rs.bk
+.git/
+.github/
+*.log
+*.sock
+tmp/
+.DS_Store
+docker-compose.kafka.yml
