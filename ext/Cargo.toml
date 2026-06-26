@@ -1,0 +1,36 @@
+[package]
+name = "hi-kafka"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Hi-Kafka PHP extension"
+
+[lib]
+name = "hi_kafka"
+crate-type = ["cdylib", "lib"]
+
+[features]
+default = []
+# 开发态 / 本地裸 Kafka。vendor librdkafka 静态编，不带 SSL/SASL。
+kafka = ["hi-kafka-worker/kafka"]
+# 生产**唯一推荐**：vendor librdkafka + vendor OpenSSL + 系统 libsasl2/libz。
+# 云上 Kafka（OAUTHBEARER / SCRAM-SHA / SSL）必须用这个。
+# 编译时额外要：perl + bash + cmake；运行时只多依赖 libsasl2 + libz。
+#
+# **必须同时打开 ext 自己的 "kafka" feature**——`worker_entry.rs` 里的
+# `#[cfg(feature = "kafka")]` 守护着 KafkaProducer / KafkaConsumer 的选择，
+# 漏掉就编出来跑 LoggingProducer（fake ack，offset=-1），生产事故。
+kafka-vendored-tls = ["kafka", "hi-kafka-worker/kafka-vendored-tls"]
+
+[dependencies]
+hi-kafka-proto.workspace = true
+hi-kafka-worker = { path = "../worker", default-features = false }
+ext-php-rs = "0.13"
+bytes.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+libc = "0.2"
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
