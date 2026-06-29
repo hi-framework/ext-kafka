@@ -13,16 +13,16 @@
     },
     "autoload": {
         "psr-4": {
-            "Hi\\Kafka\\": "php-driver/src/Hi/Kafka/"
+            "Hi\\Kafka\\": "src/Hi/Kafka/"
         },
         "files": [
-            "php-driver/stubs/hi_kafka_functions.php"
+            "stubs/hi_kafka_functions.php"
         ]
     },
     "extra": {
         "phpstan": {
             "includes": [
-                "php-driver/stubs/hi_kafka_functions.php"
+                "stubs/hi_kafka_functions.php"
             ]
         }
     }

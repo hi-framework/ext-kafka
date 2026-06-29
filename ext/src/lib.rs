@@ -15,6 +15,7 @@
 )]
 
 mod client;
+mod client_interface;
 mod cluster_replay;
 mod ini_config;
 mod ipc;
@@ -996,8 +997,14 @@ fn put<V: IntoZval>(ht: &mut ZendHashTable, key: &str, value: V) -> PhpResult<()
 ///
 /// 函数体里 `module_number` 是宏内部 `fn internal(ty, module_number)` 的参数名，
 /// 直接引用即可（不需要在签名里声明）。
-#[php_startup]
+///
+/// **顺序约束**：`client_interface::register()` 必须在 `#[php_class]` 类注册之前
+/// 完成——`Hi\Kafka\Client` 的 `#[implements(crate::client_interface::get_ce())]`
+/// 在 ext-php-rs 自动生成的 class 注册块里 evaluate 那个表达式，此时 CE 必须 ready。
+/// 用 `#[php_startup(before)]` 让本函数体在 class 注册**之前**跑。
+#[php_startup(before)]
 fn module_startup() {
+    client_interface::register();
     ini_config::register(module_number);
 }
 
