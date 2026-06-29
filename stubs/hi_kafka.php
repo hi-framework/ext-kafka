@@ -352,6 +352,17 @@ namespace Hi\Kafka {
         public function ensureWorker(): void {}
         /** @return array{socket: string, max_idle: int, idle: int, created: int} */
         public function stats(): array {}
+        // Phase 3.x（与 Client 对齐）
+        public function pause(int $subscriptionId, array $topics, array $partitions, int $timeoutMs = 5000): void {}
+        public function resume(int $subscriptionId, array $topics, array $partitions, int $timeoutMs = 5000): void {}
+        public function seek(int $subscriptionId, array $topics, array $partitions, array $offsets, int $timeoutMs = 10000): void {}
+        public function seekToTimestamp(int $subscriptionId, int $timestampMs, array $topics, array $partitions, int $timeoutMs = 15000): void {}
+        public function beginTransaction(string $cluster, int $timeoutMs = 30000): void {}
+        public function commitTransaction(string $cluster, int $timeoutMs = 30000): void {}
+        public function abortTransaction(string $cluster, int $timeoutMs = 30000): void {}
+        public function sendOffsetsToTransaction(string $producerCluster, int $subscriptionId, string $groupId, array $topics, array $partitions, array $offsets, int $timeoutMs = 30000): void {}
+        public function setOAuthBearerToken(string $cluster, string $token, int $lifetimeMs, string $principalName, array $extensions = [], int $timeoutMs = 5000): void {}
+        public function pollRebalanceEvents(int $subscriptionId, int $maxEvents = 100, int $timeoutMs = 5000): array {}
     }
 
     /**
@@ -383,6 +394,17 @@ namespace Hi\Kafka {
         public function ensureWorker(): void {}
         /** @return array{socket: string, max_idle: int, idle: int, created: int} */
         public function stats(): array {}
+        // Phase 3.x（与 Client 对齐）
+        public function pause(int $subscriptionId, array $topics, array $partitions, int $timeoutMs = 5000): void {}
+        public function resume(int $subscriptionId, array $topics, array $partitions, int $timeoutMs = 5000): void {}
+        public function seek(int $subscriptionId, array $topics, array $partitions, array $offsets, int $timeoutMs = 10000): void {}
+        public function seekToTimestamp(int $subscriptionId, int $timestampMs, array $topics, array $partitions, int $timeoutMs = 15000): void {}
+        public function beginTransaction(string $cluster, int $timeoutMs = 30000): void {}
+        public function commitTransaction(string $cluster, int $timeoutMs = 30000): void {}
+        public function abortTransaction(string $cluster, int $timeoutMs = 30000): void {}
+        public function sendOffsetsToTransaction(string $producerCluster, int $subscriptionId, string $groupId, array $topics, array $partitions, array $offsets, int $timeoutMs = 30000): void {}
+        public function setOAuthBearerToken(string $cluster, string $token, int $lifetimeMs, string $principalName, array $extensions = [], int $timeoutMs = 5000): void {}
+        public function pollRebalanceEvents(int $subscriptionId, int $maxEvents = 100, int $timeoutMs = 5000): array {}
     }
 }
 
@@ -531,6 +553,18 @@ namespace {
     function hi_kafka_header_len(): int {}
 
     /**
+     * 编一帧 HELLO 协议握手，返回完整 14B 帧字节
+     * @internal
+     */
+    function hi_kafka_encode_hello_frame(): string {}
+
+    /**
+     * 校验 HELLO RESP 完整帧（14B），版本不匹配或格式错误抛异常
+     * @internal
+     */
+    function hi_kafka_verify_hello_resp(string $bytes): void {}
+
+    /**
      * 编一帧 PRODUCE_FNF（fire-and-forget），返回完整帧字节
      * @param array<string,string>|null $headers
      * @internal
@@ -626,9 +660,74 @@ namespace {
      *     ok: bool,
      *     subscription_id?: int,
      *     messages?: array,
+     *     events?: array,
      *     message?: string,
      * }
      * @internal
      */
     function hi_kafka_decode_consumer_resp(string $bytes): array {}
+
+    // ========================================================================
+    // Phase 3.x REQ encoders（给 SwooleClient/SwowClient driver 用）
+    // ========================================================================
+
+    /**
+     * 编一帧 PAUSE_RESUME_REQ。$op 0=Pause / 1=Resume；空数组 = 当前 assignment 全部。
+     * @param string[] $topics
+     * @param int[]    $partitions
+     * @return array{cid:int, frame:string}
+     * @internal
+     */
+    function hi_kafka_encode_pause_resume_frame(int $subscriptionId, int $op, array $topics, array $partitions): array {}
+
+    /**
+     * 编一帧 SEEK_REQ（按 offset 模式）
+     * @param string[] $topics
+     * @param int[]    $partitions
+     * @param int[]    $offsets
+     * @return array{cid:int, frame:string}
+     * @internal
+     */
+    function hi_kafka_encode_seek_by_offset_frame(int $subscriptionId, array $topics, array $partitions, array $offsets): array {}
+
+    /**
+     * 编一帧 SEEK_REQ（按 timestamp 模式）
+     * @param string[] $topics
+     * @param int[]    $partitions
+     * @return array{cid:int, frame:string}
+     * @internal
+     */
+    function hi_kafka_encode_seek_by_timestamp_frame(int $subscriptionId, int $timestampMs, array $topics, array $partitions): array {}
+
+    /**
+     * 编一帧 TXN_REQ。$op 0=Begin / 1=Commit / 2=Abort
+     * @return array{cid:int, frame:string}
+     * @internal
+     */
+    function hi_kafka_encode_txn_frame(string $cluster, int $op): array {}
+
+    /**
+     * 编一帧 SEND_OFFSETS_REQ（EOS stream）
+     * @param string[] $topics
+     * @param int[]    $partitions
+     * @param int[]    $offsets
+     * @return array{cid:int, frame:string}
+     * @internal
+     */
+    function hi_kafka_encode_send_offsets_frame(string $producerCluster, int $subscriptionId, string $groupId, array $topics, array $partitions, array $offsets): array {}
+
+    /**
+     * 编一帧 SET_OAUTH_BEARER_TOKEN_REQ
+     * @param array<string,string>|null $extensions
+     * @return array{cid:int, frame:string}
+     * @internal
+     */
+    function hi_kafka_encode_set_oauth_token_frame(string $cluster, string $token, int $lifetimeMs, string $principalName, ?array $extensions = null): array {}
+
+    /**
+     * 编一帧 POLL_REBALANCE_REQ
+     * @return array{cid:int, frame:string}
+     * @internal
+     */
+    function hi_kafka_encode_poll_rebalance_frame(int $subscriptionId, int $maxEvents): array {}
 }
