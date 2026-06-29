@@ -8,3 +8,4 @@
 *.dylib
 /tmp/
 /dist
+/vendor
