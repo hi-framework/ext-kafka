@@ -22,7 +22,7 @@ $group = 'rb-grp-' . posix_getpid();
 
 // === 准备 3 分区 topic ===
 echo "=== 0. 创建 3 分区 topic ===" . PHP_EOL;
-shell_exec("docker exec hi-kafka-ext-kafka_kraft-1 /opt/bitnami/kafka/bin/kafka-topics.sh "
+shell_exec("docker exec hi-kafka-ext-kafka_kraft-1 /opt/kafka/bin/kafka-topics.sh "
     . "--bootstrap-server localhost:9092 --create --topic $topic --partitions 3 --replication-factor 1 2>&1");
 
 $client = new Hi\Kafka\Client($socket);
