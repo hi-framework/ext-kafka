@@ -16,6 +16,7 @@
 
 pub mod codec;
 pub mod consumer;
+pub mod error;
 pub mod frame;
 pub mod oauth;
 pub mod pause_resume;
@@ -30,6 +31,7 @@ pub use consumer::{
     CommitReq, CommitResp, ConsumerMessage, PollReq, PollResp, RegisterClusterReq,
     RegisterClusterResp, SubscribeReq, SubscribeResp, UnsubscribeReq,
 };
+pub use error::{ErrorKind, ErrorResp};
 pub use frame::{Frame, FrameType, HEADER_LEN, MAX_PAYLOAD_LEN, PROTOCOL_MAJOR};
 pub use oauth::{SetOAuthBearerTokenReq, SetOAuthBearerTokenResp};
 pub use pause_resume::{PauseResumeOp, PauseResumeReq, PauseResumeResp};
