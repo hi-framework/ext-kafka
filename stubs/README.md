@@ -1,5 +1,13 @@
 # hi-kafka IDE / 静态分析 stubs
 
+> **⚠ DEPRECATED（自 2026-07）**：本单文件 stub 包 `hi/kafka-stubs` 已归入
+> `hi/kafka-driver` composer 包（含 `Hi\Kafka\Client` / `SwooleClient` / `SwowClient`
+> 类桩 + `hi_kafka_*` 全局函数桩）。新项目直接 `composer require hi/kafka-driver`
+> 即可拿到全部类型信息，无需独立引入 `hi/kafka-stubs`。
+>
+> 本目录保留用于**历史兼容**——已经在用 `hi/kafka-stubs` 的下游项目下次
+> 发版切换到 `hi/kafka-driver` 前仍可继续使用。将于**下一 major 版本**移除。
+
 `hi-kafka` PHP 扩展的类型声明文件，专供 IDE 自动补全与静态分析使用。
 
 **不要在运行时 `require`** —— 真正的实现由 .so 提供，require 会撞 fatal "Cannot redeclare"。

@@ -19,7 +19,7 @@ hi-kafka-ext/
 │   │   └── SwowClient.php         # Swow 协程驱动（真实现）
 │   └── stubs/
 │       └── hi_kafka_functions.php # 全局函数桩（function_exists guard）
-├── stubs/                 # 单文件 PHPStan/IDE stub 包（hi/kafka-stubs，单独可发布）
+├── stubs/                 # ⚠ DEPRECATED：单文件 stub 包 hi/kafka-stubs，功能已合入 hi/kafka-driver
 ├── composer.json          # 仓库根 composer 包 hi/kafka-driver
 ├── tests/php/             # e2e PHP 测试脚本
 ├── scripts/               # build / smoke / kafka 测试
@@ -128,7 +128,13 @@ composer require hi/kafka-driver
 | 装了扩展（生产 / 测试） | 扩展真实现 | 扩展真实现 |
 | 没装扩展（开发机 / IDE / CI 索引） | composer 桩，no-op 但类型可解析 | composer 桩，no-op |
 
-PHPStan / Psalm / PHPStorm 自动识别签名，**无需手工 "Mark As Reference File"**。如果只想要单文件 stubs（不走 composer），仍可用 `stubs/hi_kafka.php`（包 `hi/kafka-stubs`，专门给 PHPStan 用）。
+PHPStan / Psalm / PHPStorm 自动识别签名，**无需手工 "Mark As Reference File"**。stubs 以 `php-driver/` 随 `hi/kafka-driver` 发布为准。
+
+> **⚠ `stubs/` 目录已 DEPRECATED**（自 2026-07）：原独立包 `hi/kafka-stubs`（顶层
+> `stubs/hi_kafka.php` 单文件）功能已合并到 `hi/kafka-driver`——`Client.php` /
+> `SwooleClient.php` / `SwowClient.php` 类桩 + `hi_kafka_functions.php` 全局函数桩
+> 都在同一个 composer 包里。新项目直接 `composer require hi/kafka-driver` 即可；
+> 已在用 `hi/kafka-stubs` 的下游项目**下一 major 版本会移除**该包，请提前迁移。
 
 ## 开发
 
