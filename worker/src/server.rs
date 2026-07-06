@@ -986,8 +986,10 @@ async fn handle_produce_req_inner(
             .await;
         }
     };
-    debug!(cid, cluster = %msg.cluster, topic = %msg.topic, "PRODUCE_REQ received");
-    match producer.produce_ack(msg).await {
+    let timeout = Duration::from_millis(req_timeout_ms(msg.timeout_ms));
+    let produce_msg = msg.msg;
+    debug!(cid, cluster = %produce_msg.cluster, topic = %produce_msg.topic, ?timeout, "PRODUCE_REQ received");
+    match producer.produce_ack(produce_msg, timeout).await {
         Ok(resp) => {
             Metrics::inc(&metrics.produce_resp_ok_total);
             let mut resp_payload = BytesMut::new();
@@ -1001,6 +1003,17 @@ async fn handle_produce_req_inner(
             write_error_frame(stream, cid, WorkerError::from_anyhow(&e)).await
         }
     }
+}
+
+/// worker 侧兜底：v1 legacy 帧走 `DEFAULT_PRODUCE_TIMEOUT_MS`（正数），v2 帧
+/// 走扩展侧 `require_positive_u32` 校验（也是正数）——正常路径 `timeout_ms` 一定 ≥ 1。
+///
+/// 这里的 `.max(1)` 是**深度防御**：万一未来协议改动漏了校验、或第三方客户端
+/// 直接构造裸帧，避免 0 ms 传给 `tokio::time::timeout` 造成"立即触发 Timeout"
+/// 的迷惑行为。业务侧看到的 KafkaException.kind_name = "TIMEOUT"，但 message
+/// 是 "produceSync timed out after 1 ms"——比 "0 ms" 更好识别是防御路径。
+fn req_timeout_ms(timeout_ms: u32) -> u64 {
+    timeout_ms.max(1) as u64
 }
 
 async fn write_frame(

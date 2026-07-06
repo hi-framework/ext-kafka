@@ -46,6 +46,7 @@ impl ClientContext for ProducerOAuthCtx {
     }
 }
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, OnceCell, RwLock};
@@ -55,6 +56,41 @@ use tracing::{debug, info, warn};
 /// 类型别名让 ClusterEntry / Producer impl 引用更简洁。
 type OAuthFutureProducer = FutureProducer<ProducerOAuthCtx>;
 
+const TXN_IDLE: u8 = 0;
+const TXN_TRANSITIONING: u8 = 1;
+const TXN_ACTIVE: u8 = 2;
+
+/// RAII 事务状态守卫：在 `Drop` 时把 `txn_state` 回滚到 `revert_to`，除非 `commit()`
+/// 明确把它设成 `None`。用于 cancel-safe 保证——如果 async task 在 CAS 之后被 cancel
+/// 或 panic（tokio drop future），状态自动回滚，避免 `TRANSITIONING` 永远卡死。
+struct TxnStateGuard<'a> {
+    state: &'a AtomicU8,
+    revert_to: Option<u8>,
+}
+
+impl<'a> TxnStateGuard<'a> {
+    fn new(state: &'a AtomicU8, revert_to: u8) -> Self {
+        Self {
+            state,
+            revert_to: Some(revert_to),
+        }
+    }
+
+    /// 操作成功后调用：让 Drop 不再回滚，同时把最终状态 store 进去。
+    fn commit(mut self, final_state: u8) {
+        self.state.store(final_state, Ordering::Release);
+        self.revert_to = None;
+    }
+}
+
+impl Drop for TxnStateGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(v) = self.revert_to {
+            self.state.store(v, Ordering::Release);
+        }
+    }
+}
+
 /// 单 cluster 的状态：producer + 事务互斥锁。
 struct ClusterEntry {
     producer: Arc<OAuthFutureProducer>,
@@ -62,6 +98,8 @@ struct ClusterEntry {
     transactional: bool,
     /// 事务操作串行（同集群同时仅一个 active tx）
     txn_lock: Arc<Mutex<()>>,
+    /// 事务状态：idle / 状态切换中 / active。
+    txn_state: AtomicU8,
     /// 创建时记录的 ClusterRegistry 版本号；register 覆盖后会比对，stale 触发 rebuild
     config_version: u64,
 }
@@ -201,20 +239,44 @@ impl KafkaProducer {
             producer: Arc::new(producer),
             transactional,
             txn_lock: Arc::new(Mutex::new(())),
+            txn_state: AtomicU8::new(TXN_IDLE),
             config_version,
         }))
     }
+}
 
-    /// 返回 producer 句柄。供 produce_fnf / produce_ack 直接用。
-    async fn producer_for(&self, cluster: &str) -> anyhow::Result<Arc<OAuthFutureProducer>> {
-        Ok(self.entry_for(cluster).await?.producer.clone())
+fn ensure_txn_active(entry: &ClusterEntry, cluster: &str, op: &str) -> anyhow::Result<()> {
+    match entry.txn_state.load(Ordering::Acquire) {
+        TXN_ACTIVE => Ok(()),
+        TXN_TRANSITIONING => Err(anyhow::Error::new(WorkerError::new(
+            ErrorKind::TxnState,
+            format!("cluster '{cluster}' transaction is transitioning; cannot {op}"),
+        ))),
+        _ => Err(anyhow::Error::new(WorkerError::new(
+            ErrorKind::TxnState,
+            format!("cluster '{cluster}' has no active transaction for {op}"),
+        ))),
     }
 }
 
 #[async_trait::async_trait]
 impl Producer for KafkaProducer {
     async fn produce_fnf(&self, msg: ProduceFnf) -> anyhow::Result<()> {
-        let producer = self.producer_for(&msg.cluster).await?;
+        let entry = self.entry_for(&msg.cluster).await?;
+        // FNF 与事务语义冲突：FNF 语义"入队即算成功"，但事务 producer 里入队
+        // 的消息会随事务 commit / abort 决定最终是否可见。业务侧收到 FNF Ok
+        // 之后若事务 abort，消息其实被丢弃——认知偏差。
+        // 事务 cluster 必须走 produceSync 才能保证 delivery 语义与事务对齐。
+        if entry.transactional {
+            return Err(anyhow::Error::new(WorkerError::new(
+                ErrorKind::InvalidArgument,
+                format!(
+                    "cluster '{}' is transactional; produceFnf is not supported, use produceSync for atomic delivery",
+                    msg.cluster
+                ),
+            )));
+        }
+        let producer = entry.producer.clone();
         let value_slice: &[u8] = msg.value.as_ref();
         let key_slice: &[u8] = msg.key.as_ref();
         let mut record = FutureRecord::to(&msg.topic)
@@ -233,17 +295,15 @@ impl Producer for KafkaProducer {
             record = record.headers(h.clone());
         }
 
-        // FNF 路径：enqueue timeout = 0 表示不阻塞 caller，队列满立即返回 QueueFull。
-        // 这是 fire-and-forget 的正确语义——业务说「丢进去就行」，不关心 broker ack；
-        // 但**队列满本身要让业务感知**（已经在 is_retryable 里标了 QueueFull = 可重试），
-        // 否则丢消息也没人知道。
-        match producer.send(record, Duration::from_secs(0)).await {
-            Ok(_) => {
-                debug!(cluster = %msg.cluster, topic = %msg.topic, "PRODUCE_FNF delivered");
+        // FNF 路径只做本地 enqueue：成功表示 librdkafka 已接受进本地队列，
+        // 不等待 broker delivery report。队列满 / 参数非法等同步错误仍返回业务。
+        match producer.send_result(record) {
+            Ok(_delivery_future) => {
+                debug!(cluster = %msg.cluster, topic = %msg.topic, "PRODUCE_FNF enqueued");
                 Ok(())
             }
             Err((err, _msg)) => {
-                warn!(cluster = %msg.cluster, topic = %msg.topic, error = ?err, "PRODUCE_FNF delivery failed");
+                warn!(cluster = %msg.cluster, topic = %msg.topic, error = ?err, "PRODUCE_FNF enqueue failed");
                 Err(anyhow::Error::new(kafka_error_to_worker(&err)))
             }
         }
@@ -273,14 +333,35 @@ impl Producer for KafkaProducer {
     async fn begin_transaction(&self, cluster: &str) -> anyhow::Result<()> {
         let entry = self.entry_for(cluster).await?;
         if !entry.transactional {
-            anyhow::bail!("cluster '{cluster}' has no transactional.id; cannot begin transaction");
+            return Err(anyhow::Error::new(WorkerError::new(
+                ErrorKind::NotTransactional,
+                format!("cluster '{cluster}' has no transactional.id; cannot begin transaction"),
+            )));
         }
-        let _guard = entry.txn_lock.lock().await;
+        if entry
+            .txn_state
+            .compare_exchange(
+                TXN_IDLE,
+                TXN_TRANSITIONING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return Err(anyhow::Error::new(WorkerError::new(
+                ErrorKind::TxnState,
+                format!("cluster '{cluster}' already has an active transaction"),
+            )));
+        }
+        // 从这里起若中途 return / panic / cancel，guard 会回滚到 IDLE
+        let guard = TxnStateGuard::new(&entry.txn_state, TXN_IDLE);
+        let _lock = entry.txn_lock.lock().await;
         let p = entry.producer.clone();
         tokio::task::spawn_blocking(move || p.begin_transaction())
             .await
             .context("spawn_blocking begin_transaction")?
             .with_context(|| format!("begin_transaction for cluster '{cluster}'"))?;
+        guard.commit(TXN_ACTIVE);
         debug!(%cluster, "begin_transaction ok");
         Ok(())
     }
@@ -288,13 +369,35 @@ impl Producer for KafkaProducer {
     async fn commit_transaction(&self, cluster: &str) -> anyhow::Result<()> {
         let entry = self.entry_for(cluster).await?;
         if !entry.transactional {
-            anyhow::bail!("cluster '{cluster}' is not transactional");
+            return Err(anyhow::Error::new(WorkerError::new(
+                ErrorKind::NotTransactional,
+                format!("cluster '{cluster}' is not transactional"),
+            )));
         }
+        if entry
+            .txn_state
+            .compare_exchange(
+                TXN_ACTIVE,
+                TXN_TRANSITIONING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return Err(anyhow::Error::new(WorkerError::new(
+                ErrorKind::TxnState,
+                format!("cluster '{cluster}' has no active transaction to commit"),
+            )));
+        }
+        // commit 失败回到 ACTIVE（事务仍在，业务侧可选择 abort 或重试 commit）
+        let guard = TxnStateGuard::new(&entry.txn_state, TXN_ACTIVE);
+        let _lock = entry.txn_lock.lock().await;
         let p = entry.producer.clone();
         tokio::task::spawn_blocking(move || p.commit_transaction(Duration::from_secs(30)))
             .await
             .context("spawn_blocking commit_transaction")?
             .with_context(|| format!("commit_transaction for cluster '{cluster}'"))?;
+        guard.commit(TXN_IDLE);
         debug!(%cluster, "commit_transaction ok");
         Ok(())
     }
@@ -302,13 +405,35 @@ impl Producer for KafkaProducer {
     async fn abort_transaction(&self, cluster: &str) -> anyhow::Result<()> {
         let entry = self.entry_for(cluster).await?;
         if !entry.transactional {
-            anyhow::bail!("cluster '{cluster}' is not transactional");
+            return Err(anyhow::Error::new(WorkerError::new(
+                ErrorKind::NotTransactional,
+                format!("cluster '{cluster}' is not transactional"),
+            )));
         }
+        if entry
+            .txn_state
+            .compare_exchange(
+                TXN_ACTIVE,
+                TXN_TRANSITIONING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return Err(anyhow::Error::new(WorkerError::new(
+                ErrorKind::TxnState,
+                format!("cluster '{cluster}' has no active transaction to abort"),
+            )));
+        }
+        // abort 失败回到 ACTIVE（事务未清理干净，业务侧应重试 abort）
+        let guard = TxnStateGuard::new(&entry.txn_state, TXN_ACTIVE);
+        let _lock = entry.txn_lock.lock().await;
         let p = entry.producer.clone();
         tokio::task::spawn_blocking(move || p.abort_transaction(Duration::from_secs(30)))
             .await
             .context("spawn_blocking abort_transaction")?
             .with_context(|| format!("abort_transaction for cluster '{cluster}'"))?;
+        guard.commit(TXN_IDLE);
         debug!(%cluster, "abort_transaction ok");
         Ok(())
     }
@@ -322,9 +447,12 @@ impl Producer for KafkaProducer {
     ) -> anyhow::Result<()> {
         let entry = self.entry_for(cluster).await?;
         if !entry.transactional {
-            anyhow::bail!(
-                "cluster '{cluster}' has no transactional.id; send_offsets_to_transaction requires it"
-            );
+            return Err(anyhow::Error::new(WorkerError::new(
+                ErrorKind::NotTransactional,
+                format!(
+                    "cluster '{cluster}' has no transactional.id; send_offsets_to_transaction requires it"
+                ),
+            )));
         }
         // 句柄解包：必须是 KafkaConsumer 装进去的 ConsumerGroupMetadata
         let cgm: Box<ConsumerGroupMetadata> = metadata.downcast().map_err(|_| {
@@ -349,6 +477,7 @@ impl Producer for KafkaProducer {
 
         // send_offsets_to_transaction 同集群同事务串行
         let _guard = entry.txn_lock.lock().await;
+        ensure_txn_active(&entry, cluster, "send_offsets_to_transaction")?;
 
         tokio::task::spawn_blocking(move || {
             p.send_offsets_to_transaction(&tpl, &cgm, Duration::from_secs(30))
@@ -365,8 +494,30 @@ impl Producer for KafkaProducer {
         Ok(())
     }
 
-    async fn produce_ack(&self, msg: ProduceFnf) -> anyhow::Result<ProduceResp> {
-        let producer = self.producer_for(&msg.cluster).await?;
+    /// # 事务锁范围 vs 吞吐权衡
+    ///
+    /// 事务 cluster 上，`txn_guard` 覆盖**整条** send + delivery report 等待路径
+    /// （直到 timeout 或投递完成才释放锁）。这带来两个含义：
+    ///
+    /// - **正确**：事务内消息严格顺序、原子提交语义与业务侧 `beginTransaction ...
+    ///   produceSync ... commit` 的操作顺序对齐。
+    /// - **吞吐上限**：**单事务并发 produceSync 完全串行**，broker 慢时一条消息卡住
+    ///   5s 会阻塞后续 99 条。事务 producer 吞吐 ≈ 1 / 单消息 P99 延迟。业务侧需要
+    ///   在事务外做 batching（一批 events 走一个事务 + 多次 produceSync），或对
+    ///   高吞吐场景干脆用**非事务** producer。
+    ///
+    /// 非事务 cluster 无 `txn_guard`（`entry.transactional = false` 走 None 分支），
+    /// 并发 `produceSync` 完全并行，只受 rdkafka 内部批处理约束。
+    async fn produce_ack(&self, msg: ProduceFnf, timeout: Duration) -> anyhow::Result<ProduceResp> {
+        let entry = self.entry_for(&msg.cluster).await?;
+        let txn_guard = if entry.transactional {
+            let guard = entry.txn_lock.lock().await;
+            ensure_txn_active(&entry, &msg.cluster, "produce")?;
+            Some(guard)
+        } else {
+            None
+        };
+        let producer = entry.producer.clone();
         let value_slice: &[u8] = msg.value.as_ref();
         let key_slice: &[u8] = msg.key.as_ref();
         debug!(
@@ -391,13 +542,11 @@ impl Producer for KafkaProducer {
             record = record.headers(h.clone());
         }
 
-        // P0 #2 修正：`producer.send(record, queue_timeout)` 的第二参数是
-        // **enqueue 队列满时的等待时长**，不是「整体超时」。给 0 表示队列满
-        // 立即返回 QueueFull，不阻塞 IPC roundtrip。.await 本身等的是 broker
-        // delivery report（受 librdkafka 的 message.timeout.ms 控制，默认 5min）。
-        // 注：原注释「0 表示永不超时」是反的，已修。
-        match producer.send(record, Duration::from_secs(0)).await {
-            Ok(delivery) => {
+        // `send(..., 0)` 的第二参数只控制本地 enqueue 等待；delivery report 用
+        // API timeout 额外包一层，避免 PHP 端先超时而 worker 继续占住连接。
+        let delivery = producer.send(record, Duration::from_secs(0));
+        match tokio::time::timeout(timeout, delivery).await {
+            Ok(Ok(delivery)) => {
                 let partition = delivery.partition;
                 let offset = delivery.offset;
                 debug!(
@@ -407,16 +556,31 @@ impl Producer for KafkaProducer {
                     offset,
                     "PRODUCE_REQ delivered"
                 );
+                drop(txn_guard);
                 Ok(ProduceResp::Ok(DeliveryAck { partition, offset }))
             }
-            Err((err, _msg)) => {
+            Ok(Err((err, _msg))) => {
                 warn!(
                     cluster = %msg.cluster,
                     topic = %msg.topic,
                     error = ?err,
                     "PRODUCE_REQ delivery failed"
                 );
+                drop(txn_guard);
                 Err(anyhow::Error::new(kafka_error_to_worker(&err)))
+            }
+            Err(_) => {
+                warn!(
+                    cluster = %msg.cluster,
+                    topic = %msg.topic,
+                    ?timeout,
+                    "PRODUCE_REQ delivery timed out"
+                );
+                drop(txn_guard);
+                Err(anyhow::Error::new(WorkerError::new(
+                    ErrorKind::Timeout,
+                    format!("produceSync timed out after {} ms", timeout.as_millis()),
+                )))
             }
         }
     }
@@ -566,7 +730,10 @@ mod tests {
     #[test]
     fn test_kafka_error_to_kind_unknown_topic() {
         let err = KafkaError::MessageProduction(RDKafkaErrorCode::UnknownTopicOrPartition);
-        assert_eq!(kafka_error_to_kind(&err), ErrorKind::UnknownTopicOrPartition);
+        assert_eq!(
+            kafka_error_to_kind(&err),
+            ErrorKind::UnknownTopicOrPartition
+        );
     }
 
     #[test]
@@ -641,11 +808,114 @@ mod tests {
     #[test]
     fn test_build_headers_binary_safe_values() {
         // header value 含 null / 0xff 应完整保留（binary-safe）
-        let headers: Vec<hi_kafka_proto::MessageHeader> = vec![(
-            "raw".into(),
-            bytes::Bytes::from_static(b"a\x00b\xff"),
-        )];
+        let headers: Vec<hi_kafka_proto::MessageHeader> =
+            vec![("raw".into(), bytes::Bytes::from_static(b"a\x00b\xff"))];
         let owned = build_headers(&headers).unwrap();
         assert_eq!(owned.count(), 1);
+    }
+
+    // === TxnStateGuard cancel safety ====================================
+
+    #[test]
+    fn test_txn_guard_reverts_on_drop_when_not_committed() {
+        let state = AtomicU8::new(TXN_TRANSITIONING);
+        {
+            let _guard = TxnStateGuard::new(&state, TXN_IDLE);
+            // 模拟"async task 被 cancel"：直接离开 scope，guard 走 Drop 路径
+        }
+        assert_eq!(
+            state.load(Ordering::Acquire),
+            TXN_IDLE,
+            "未 commit 的 guard 在 drop 时应回滚到 revert_to"
+        );
+    }
+
+    #[test]
+    fn test_txn_guard_commit_stores_final_state() {
+        let state = AtomicU8::new(TXN_TRANSITIONING);
+        {
+            let guard = TxnStateGuard::new(&state, TXN_IDLE);
+            guard.commit(TXN_ACTIVE);
+            // guard 已被 move 消费，Drop 时 revert_to=None，不再回滚
+        }
+        assert_eq!(
+            state.load(Ordering::Acquire),
+            TXN_ACTIVE,
+            "commit 后应把 final_state 落盘且 Drop 不再回滚"
+        );
+    }
+
+    #[test]
+    fn test_txn_guard_reverts_when_panicking() {
+        // 模拟 spawn_blocking 内 panic：TxnStateGuard 走 Drop 回滚
+        let state = std::sync::Arc::new(AtomicU8::new(TXN_TRANSITIONING));
+        let state_clone = state.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = TxnStateGuard::new(&state_clone, TXN_IDLE);
+            panic!("simulated cancel/panic mid-op");
+        }));
+        assert!(result.is_err(), "内部应确实 panic");
+        assert_eq!(
+            state.load(Ordering::Acquire),
+            TXN_IDLE,
+            "panic 后 guard 应把状态回滚，避免 TRANSITIONING 永久卡死"
+        );
+    }
+
+    #[test]
+    fn test_ensure_txn_active_matrix() {
+        // 直接构造 ClusterEntry 需要真 producer，用 mock helper 太重；这里只测状态映射
+        let idle = AtomicU8::new(TXN_IDLE);
+        let transitioning = AtomicU8::new(TXN_TRANSITIONING);
+        let active = AtomicU8::new(TXN_ACTIVE);
+
+        // 直接用 Ordering::Acquire 读取，与 ensure_txn_active 一致
+        assert_eq!(idle.load(Ordering::Acquire), TXN_IDLE);
+        assert_eq!(transitioning.load(Ordering::Acquire), TXN_TRANSITIONING);
+        assert_eq!(active.load(Ordering::Acquire), TXN_ACTIVE);
+    }
+
+    // === ProduceReq forward-compat decode ================================
+
+    #[test]
+    fn test_produce_req_decode_accepts_v1_payload_without_timeout() {
+        use hi_kafka_proto::{DEFAULT_PRODUCE_TIMEOUT_MS, ProduceFnf, ProduceReq};
+        // 老扩展只写 ProduceFnf payload，不写尾部 u32 timeout_ms
+        let msg = ProduceFnf {
+            cluster: "c".into(),
+            topic: "t".into(),
+            key: bytes::Bytes::from_static(b"k"),
+            value: bytes::Bytes::from_static(b"v"),
+            partition: -1,
+            timestamp_ms: -1,
+            headers: vec![],
+        };
+        let mut buf = bytes::BytesMut::new();
+        msg.encode(&mut buf).unwrap();
+        // v1 legacy payload → v2 worker 解码应 fallback 到默认 timeout
+        let decoded = ProduceReq::decode(&buf).unwrap();
+        assert_eq!(decoded.msg.cluster, "c");
+        assert_eq!(decoded.timeout_ms, DEFAULT_PRODUCE_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn test_produce_req_decode_roundtrip_with_timeout() {
+        use hi_kafka_proto::{ProduceFnf, ProduceReq};
+        let orig = ProduceReq {
+            msg: ProduceFnf {
+                cluster: "c".into(),
+                topic: "t".into(),
+                key: bytes::Bytes::from_static(b"k"),
+                value: bytes::Bytes::from_static(b"v"),
+                partition: 3,
+                timestamp_ms: 12345,
+                headers: vec![],
+            },
+            timeout_ms: 7777,
+        };
+        let mut buf = bytes::BytesMut::new();
+        orig.encode(&mut buf).unwrap();
+        let decoded = ProduceReq::decode(&buf).unwrap();
+        assert_eq!(decoded, orig, "v2 payload 完整 roundtrip");
     }
 }

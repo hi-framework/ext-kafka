@@ -19,7 +19,11 @@ pub trait Producer: Send + Sync {
     /// 同步带 ack：等 broker delivery report 后返回带 partition/offset 的 ProduceResp。
     /// 失败时返回 `ProduceResp::Err`，不抛 anyhow 错误（broker 错误是业务可处理的）；
     /// 只有 IPC 或配置层面的不可恢复错误才走 `Err(anyhow)`。
-    async fn produce_ack(&self, msg: ProduceFnf) -> anyhow::Result<ProduceResp>;
+    async fn produce_ack(
+        &self,
+        msg: ProduceFnf,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<ProduceResp>;
 
     /// 阻塞至所有 in-flight 消息发送完成或超时。优雅停机用。
     async fn flush(&self, timeout: std::time::Duration) -> anyhow::Result<()>;
@@ -64,7 +68,11 @@ impl Producer for LoggingProducer {
         Ok(())
     }
 
-    async fn produce_ack(&self, msg: ProduceFnf) -> anyhow::Result<ProduceResp> {
+    async fn produce_ack(
+        &self,
+        msg: ProduceFnf,
+        _timeout: std::time::Duration,
+    ) -> anyhow::Result<ProduceResp> {
         info!(
             cluster = %msg.cluster,
             topic = %msg.topic,
