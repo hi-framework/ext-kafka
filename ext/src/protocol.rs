@@ -8,7 +8,8 @@ use hi_kafka_proto::{
     codec, encode_frame, CommitReq, CommitResp, ConsumerMessage, ErrorResp, FrameType, HelloReq,
     HelloResp,
     OffsetCommit, OffsetSpec, PartitionSpec, PauseResumeOp, PauseResumeReq, PauseResumeResp,
-    PayloadError, PollRebalanceReq, PollRebalanceResp, PollReq, PollResp, ProduceFnf, ProduceResp,
+    PayloadError, PollRebalanceReq, PollRebalanceResp, PollReq, PollResp, ProduceFnf, ProduceReq,
+    ProduceResp,
     RebalanceEvent, RegisterClusterReq, RegisterClusterResp, SeekReq, SeekResp, SendOffsetsReq,
     SendOffsetsResp, SetOAuthBearerTokenReq, SetOAuthBearerTokenResp, SubscribeReq, SubscribeResp,
     TxnOp, TxnReq, TxnResp, UnsubscribeReq, HEADER_LEN, PROTOCOL_MAJOR,
@@ -131,8 +132,23 @@ pub fn build_req_frame(
     headers: Vec<(String, bytes::Bytes)>,
     partition: i32,
     timestamp_ms: i64,
+    timeout_ms: u32,
 ) -> anyhow::Result<(u64, Vec<u8>)> {
-    let payload = build_payload(cluster, topic, key, value, headers, partition, timestamp_ms)?;
+    let mut payload = BytesMut::new();
+    ProduceReq {
+        msg: ProduceFnf {
+            cluster: cluster.to_string(),
+            topic: topic.to_string(),
+            key: bytes::Bytes::copy_from_slice(key),
+            value: bytes::Bytes::copy_from_slice(value),
+            partition,
+            timestamp_ms,
+            headers,
+        },
+        timeout_ms: timeout_ms.max(1),
+    }
+    .encode(&mut payload)
+    .map_err(|e| anyhow::anyhow!("encode ProduceReq: {e}"))?;
     let cid = next_cid();
     let mut buf = BytesMut::new();
     encode_frame(FrameType::ProduceReq, cid, &payload, &mut buf)
@@ -647,8 +663,8 @@ mod tests {
 
     #[test]
     fn test_req_frame_assigns_monotonic_cid() {
-        let (cid1, _) = build_req_frame("c", "t", b"k", b"v", vec![], -1, -1).unwrap();
-        let (cid2, _) = build_req_frame("c", "t", b"k", b"v", vec![], -1, -1).unwrap();
+        let (cid1, _) = build_req_frame("c", "t", b"k", b"v", vec![], -1, -1, 5000).unwrap();
+        let (cid2, _) = build_req_frame("c", "t", b"k", b"v", vec![], -1, -1, 5000).unwrap();
         assert!(cid2 > cid1);
     }
 

@@ -13,7 +13,7 @@ use hi_kafka_proto::{
     codec, encode_frame, CommitReq, CommitResp, ConsumerMessage, ErrorKind, ErrorResp, FrameType,
     OffsetCommit,
     OffsetSpec, PartitionSpec, PauseResumeOp, PauseResumeReq, PauseResumeResp, PollRebalanceReq,
-    PollRebalanceResp, PollReq, PollResp, ProduceFnf, ProduceResp, RebalanceEvent,
+    PollRebalanceResp, PollReq, PollResp, ProduceFnf, ProduceReq, ProduceResp, RebalanceEvent,
     RegisterClusterReq, RegisterClusterResp, SeekReq, SeekResp, SendOffsetsReq, SendOffsetsResp,
     SetOAuthBearerTokenReq, SetOAuthBearerTokenResp, SubscribeReq, SubscribeResp, TxnOp, TxnReq,
     TxnResp, UnsubscribeReq, HEADER_LEN,
@@ -261,6 +261,33 @@ fn encode_produce_payload_bin(
     Ok(payload)
 }
 
+fn encode_produce_req_payload_bin(
+    cluster: &str,
+    topic: &str,
+    key: &[u8],
+    value: &[u8],
+    opts: &ProduceOptions,
+    timeout: Duration,
+) -> Result<BytesMut, IpcError> {
+    let timeout_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
+    let req = ProduceReq {
+        msg: ProduceFnf {
+            cluster: cluster.to_string(),
+            topic: topic.to_string(),
+            key: bytes::Bytes::copy_from_slice(key),
+            value: bytes::Bytes::copy_from_slice(value),
+            partition: opts.partition,
+            timestamp_ms: opts.timestamp_ms,
+            headers: opts.headers.clone(),
+        },
+        timeout_ms: timeout_ms.max(1),
+    };
+    let mut payload = BytesMut::new();
+    req.encode(&mut payload)
+        .map_err(|e| IpcError::Encode(e.to_string()))?;
+    Ok(payload)
+}
+
 pub fn produce_fnf(
     socket: &str,
     cluster: &str,
@@ -374,7 +401,7 @@ fn produce_sync_bin_inner(
     timeout: Duration,
 ) -> Result<ProduceResp, IpcError> {
     ensure(socket)?;
-    let payload = encode_produce_payload_bin(cluster, topic, key, value, opts)?;
+    let payload = encode_produce_req_payload_bin(cluster, topic, key, value, opts, timeout)?;
     let cid = next_cid();
     let pool = pool::pool_for(Path::new(socket));
     let mut conn = pool.acquire()?;
@@ -387,7 +414,8 @@ fn produce_sync_bin_inner(
         Some(timeout),
     )?;
 
-    let (kind, resp_payload) = recv_resp(&mut conn, cid, timeout)?;
+    let io_timeout = timeout + Duration::from_secs(2);
+    let (kind, resp_payload) = recv_resp(&mut conn, cid, io_timeout)?;
     if kind != FrameType::ProduceResp {
         conn.poison();
         return Err(IpcError::UnexpectedKind(kind));
@@ -405,7 +433,7 @@ fn produce_sync_inner(
     timeout: Duration,
 ) -> Result<ProduceResp, IpcError> {
     ensure(socket)?;
-    let payload = encode_produce_payload(cluster, topic, key, value, opts)?;
+    let payload = encode_produce_req_payload_bin(cluster, topic, key.as_bytes(), value.as_bytes(), opts, timeout)?;
     let cid = next_cid();
     let pool = pool::pool_for(Path::new(socket));
     let mut conn = pool.acquire()?;
@@ -418,7 +446,8 @@ fn produce_sync_inner(
         Some(timeout),
     )?;
 
-    let (kind, resp_payload) = recv_resp(&mut conn, cid, timeout)?;
+    let io_timeout = timeout + Duration::from_secs(2);
+    let (kind, resp_payload) = recv_resp(&mut conn, cid, io_timeout)?;
     if kind != FrameType::ProduceResp {
         conn.poison();
         return Err(IpcError::UnexpectedKind(kind));

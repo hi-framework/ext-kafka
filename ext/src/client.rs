@@ -76,7 +76,7 @@ impl Client {
         partition: Option<i64>,
         timestampMs: Option<i64>,
     ) -> PhpResult<()> {
-        let opts = super::build_options(headers, partition, timestampMs);
+        let opts = super::build_options(headers, partition, timestampMs)?;
         ipc::produce_fnf(&self.socket, cluster, topic, key, value, opts)
             .map_err(super::ipc_err_to_php)
     }
@@ -93,8 +93,9 @@ impl Client {
         timestampMs: Option<i64>,
         timeoutMs: Option<i64>,
     ) -> PhpResult<Zval> {
-        let timeout = std::time::Duration::from_millis(timeoutMs.unwrap_or(5000).max(1) as u64);
-        let opts = super::build_options(headers, partition, timestampMs);
+        let timeout =
+            std::time::Duration::from_millis(super::require_positive_u32("timeoutMs", timeoutMs.unwrap_or(5000))? as u64);
+        let opts = super::build_options(headers, partition, timestampMs)?;
         let resp = ipc::produce_sync(&self.socket, cluster, topic, key, value, opts, timeout)
             .map_err(super::ipc_err_to_php)?;
         resp_to_zval(resp)
@@ -124,7 +125,8 @@ impl Client {
         let opts = ipc::ProduceOptions {
             headers,
             partition: partition
-                .map(|p| p.clamp(i32::MIN as i64, i32::MAX as i64) as i32)
+                .map(|p| super::require_i32("partition", p))
+                .transpose()?
                 .unwrap_or(-1),
             timestamp_ms: timestampMs.unwrap_or(-1),
         };
@@ -145,7 +147,8 @@ impl Client {
         timestampMs: Option<i64>,
         timeoutMs: Option<i64>,
     ) -> PhpResult<Zval> {
-        let timeout = std::time::Duration::from_millis(timeoutMs.unwrap_or(5000).max(1) as u64);
+        let timeout =
+            std::time::Duration::from_millis(super::require_positive_u32("timeoutMs", timeoutMs.unwrap_or(5000))? as u64);
         let key_vec: Vec<u8> = key.into();
         let value_vec: Vec<u8> = value.into();
         let headers = super::build_binary_headers(headerNames, headerValues)
@@ -153,7 +156,8 @@ impl Client {
         let opts = ipc::ProduceOptions {
             headers,
             partition: partition
-                .map(|p| p.clamp(i32::MIN as i64, i32::MAX as i64) as i32)
+                .map(|p| super::require_i32("partition", p))
+                .transpose()?
                 .unwrap_or(-1),
             timestamp_ms: timestampMs.unwrap_or(-1),
         };
@@ -189,32 +193,26 @@ impl Client {
     }
 
     /// 拉一批消息。命中 subscription gone 时透明重订阅 + 重试。
-    pub fn poll(
-        &self,
-        subscriptionId: i64,
-        maxMessages: i64,
-        timeoutMs: i64,
-    ) -> PhpResult<Zval> {
-        let messages = subscription::poll(
-            subscriptionId as u64,
-            maxMessages.max(1) as u32,
-            timeoutMs.max(0) as u32,
-        )
-        .map_err(super::ipc_err_to_php)?;
+    pub fn poll(&self, subscriptionId: i64, maxMessages: i64, timeoutMs: i64) -> PhpResult<Zval> {
+        let subscriptionId = super::require_positive_u64("subscriptionId", subscriptionId)?;
+        let maxMessages = super::clamp_u32_min("maxMessages", maxMessages, 1)?;
+        let timeoutMs = super::poll_timeout_to_u32("timeoutMs", timeoutMs)?;
+        let messages = subscription::poll(subscriptionId, maxMessages, timeoutMs)
+            .map_err(super::ipc_err_to_php)?;
         super::messages_to_zval(messages)
     }
 
     /// 同步提交 offset。命中 subscription gone 时透明重订阅 + 重试。
     pub fn commit(&self, subscriptionId: i64, timeoutMs: Option<i64>) -> PhpResult<()> {
+        let subscriptionId = super::require_positive_u64("subscriptionId", subscriptionId)?;
         let timeout = std::time::Duration::from_millis(timeoutMs.unwrap_or(5000).max(1) as u64);
-        subscription::commit(subscriptionId as u64, timeout)
-            .map_err(super::ipc_err_to_php)
+        subscription::commit(subscriptionId, timeout).map_err(super::ipc_err_to_php)
     }
 
     /// 退订。幂等。
     pub fn unsubscribe(&self, subscriptionId: i64) -> PhpResult<()> {
-        subscription::unsubscribe(subscriptionId as u64)
-            .map_err(super::ipc_err_to_php)
+        let subscriptionId = super::require_positive_u64("subscriptionId", subscriptionId)?;
+        subscription::unsubscribe(subscriptionId).map_err(super::ipc_err_to_php)
     }
 
     /// 开启事务。集群配置须含 `transactional.id`。
@@ -261,9 +259,10 @@ impl Client {
         timeoutMs: Option<i64>,
     ) -> PhpResult<()> {
         let timeout = std::time::Duration::from_millis(timeoutMs.unwrap_or(10_000).max(1) as u64);
+        let subscriptionId = super::require_positive_u64("subscriptionId", subscriptionId)?;
         let parsed = super::build_offset_targets(topics, partitions, offsets)
             .map_err(PhpException::default)?;
-        ipc::seek_by_offset(&self.socket, subscriptionId as u64, parsed, timeout)
+        ipc::seek_by_offset(&self.socket, subscriptionId, parsed, timeout)
             .map_err(super::ipc_err_to_php)
     }
 
@@ -279,16 +278,11 @@ impl Client {
         timeoutMs: Option<i64>,
     ) -> PhpResult<()> {
         let timeout = std::time::Duration::from_millis(timeoutMs.unwrap_or(15_000).max(1) as u64);
+        let subscriptionId = super::require_positive_u64("subscriptionId", subscriptionId)?;
         let parsed =
             super::build_partition_specs(topics, partitions).map_err(PhpException::default)?;
-        ipc::seek_by_timestamp(
-            &self.socket,
-            subscriptionId as u64,
-            timestampMs,
-            parsed,
-            timeout,
-        )
-        .map_err(super::ipc_err_to_php)
+        ipc::seek_by_timestamp(&self.socket, subscriptionId, timestampMs, parsed, timeout)
+            .map_err(super::ipc_err_to_php)
     }
 
     /// 为指定 cluster 推送 SASL/OAUTHBEARER token。
@@ -343,11 +337,12 @@ impl Client {
         timeoutMs: Option<i64>,
     ) -> PhpResult<()> {
         let timeout = std::time::Duration::from_millis(timeoutMs.unwrap_or(5000).max(1) as u64);
+        let subscriptionId = super::require_positive_u64("subscriptionId", subscriptionId)?;
         let parsed =
             super::build_partition_specs(topics, partitions).map_err(PhpException::default)?;
         ipc::pause_resume(
             &self.socket,
-            subscriptionId as u64,
+            subscriptionId,
             hi_kafka_proto::PauseResumeOp::Pause,
             parsed,
             timeout,
@@ -364,11 +359,12 @@ impl Client {
         timeoutMs: Option<i64>,
     ) -> PhpResult<()> {
         let timeout = std::time::Duration::from_millis(timeoutMs.unwrap_or(5000).max(1) as u64);
+        let subscriptionId = super::require_positive_u64("subscriptionId", subscriptionId)?;
         let parsed =
             super::build_partition_specs(topics, partitions).map_err(PhpException::default)?;
         ipc::pause_resume(
             &self.socket,
-            subscriptionId as u64,
+            subscriptionId,
             hi_kafka_proto::PauseResumeOp::Resume,
             parsed,
             timeout,
@@ -400,12 +396,13 @@ impl Client {
         timeoutMs: Option<i64>,
     ) -> PhpResult<()> {
         let timeout = std::time::Duration::from_millis(timeoutMs.unwrap_or(30_000).max(1) as u64);
+        let subscriptionId = super::require_positive_u64("subscriptionId", subscriptionId)?;
         let parsed = super::build_offset_targets(topics, partitions, offsets)
             .map_err(PhpException::default)?;
         ipc::send_offsets_to_transaction(
             &self.socket,
             producerCluster,
-            subscriptionId as u64,
+            subscriptionId,
             groupId,
             parsed,
             timeout,
@@ -427,9 +424,10 @@ impl Client {
         maxEvents: Option<i64>,
         timeoutMs: Option<i64>,
     ) -> PhpResult<Zval> {
-        let max = maxEvents.unwrap_or(100).max(1) as u32;
+        let subscriptionId = super::require_positive_u64("subscriptionId", subscriptionId)?;
+        let max = super::clamp_u32_min("maxEvents", maxEvents.unwrap_or(100), 1)?;
         let timeout = std::time::Duration::from_millis(timeoutMs.unwrap_or(5000).max(1) as u64);
-        let events = ipc::poll_rebalance(&self.socket, subscriptionId as u64, max, timeout)
+        let events = ipc::poll_rebalance(&self.socket, subscriptionId, max, timeout)
             .map_err(super::ipc_err_to_php)?;
         super::rebalance_events_to_zval(events)
     }
