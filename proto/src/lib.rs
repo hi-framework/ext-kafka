@@ -32,7 +32,9 @@ pub use consumer::{
     RegisterClusterResp, SubscribeReq, SubscribeResp, UnsubscribeReq,
 };
 pub use error::{ErrorKind, ErrorResp};
-pub use frame::{Frame, FrameType, HEADER_LEN, MAX_PAYLOAD_LEN, PROTOCOL_MAJOR};
+pub use frame::{
+    Frame, FrameType, DEFAULT_PRODUCE_TIMEOUT_MS, HEADER_LEN, MAX_PAYLOAD_LEN, PROTOCOL_MAJOR,
+};
 pub use oauth::{SetOAuthBearerTokenReq, SetOAuthBearerTokenResp};
 pub use pause_resume::{PauseResumeOp, PauseResumeReq, PauseResumeResp};
 pub use payload::{

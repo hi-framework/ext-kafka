@@ -2,7 +2,7 @@
 //!
 //! 在引入 protobuf 之前用最小手写格式承载消息。所有长度均为大端。
 //!
-//! ## PRODUCE_FNF / PRODUCE_REQ v1
+//! ## PRODUCE_FNF v1
 //!
 //! ```text
 //! [u16 cluster_len][cluster][u16 topic_len][topic]
@@ -12,12 +12,20 @@
 //!   [(u16 name_len)(name)(u32 value_len)(value)] × headers_count
 //! ```
 //!
-//! 两种帧的 payload 二进制布局相同。区别只在 frame type 上（FNF 单向，REQ 期待 RESP）。
-//!
 //! - `partition`：`-1` = 让 librdkafka 用 partitioner 决定（典型 key hash），其它值
 //!   指定写入分区（key 仍透传，但路由由用户控制）
 //! - `timestamp_ms`：`-1` = librdkafka 用 CreateTime（系统当前时间）
 //! - `headers`：见 Phase 3.1，空数组编码为 `[0u32]`
+//!
+//! ## PRODUCE_REQ v1
+//!
+//! ```text
+//! [PRODUCE_FNF fields...]
+//! [u32 timeout_ms]
+//! ```
+//!
+//! `timeout_ms` 是 worker 等待 broker delivery report 的上限。超时会返回结构化
+//! `TIMEOUT` 错误；已 enqueue 的消息仍可能由 librdkafka 后续完成投递。
 //!
 //! ## PRODUCE_RESP v1
 //!
@@ -192,9 +200,52 @@ pub(crate) fn read_headers(buf: &mut &[u8]) -> Result<Vec<MessageHeader>, Payloa
     Ok(headers)
 }
 
-/// PRODUCE_REQ 与 PRODUCE_FNF payload 布局完全一致，仅帧类型不同。
-/// 用类型别名表达，避免重复编解码代码。
-pub type ProduceReq = ProduceFnf;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProduceReq {
+    pub msg: ProduceFnf,
+    pub timeout_ms: u32,
+}
+
+impl ProduceReq {
+    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), PayloadError> {
+        self.msg.encode(buf)?;
+        buf.put_u32(self.timeout_ms);
+        Ok(())
+    }
+
+    pub fn decode(mut buf: &[u8]) -> Result<Self, PayloadError> {
+        let cluster = read_str_u16(&mut buf, "cluster")?;
+        let topic = read_str_u16(&mut buf, "topic")?;
+        let key = read_bytes_u32(&mut buf)?;
+        let value = read_bytes_u32(&mut buf)?;
+        if buf.remaining() < 4 + 8 {
+            return Err(PayloadError::Truncated);
+        }
+        let partition = buf.get_i32();
+        let timestamp_ms = buf.get_i64();
+        let headers = read_headers(&mut buf)?;
+        // Forward-compat：v1 扩展没写尾部 timeout_ms → 用默认，不认为是错。
+        // 这让新 worker 能吃老扩展帧，配合 frame.rs 中"PROTOCOL_MAJOR 保持 1"支持
+        // 滚动升级期间双向兼容。
+        let timeout_ms = if buf.remaining() >= 4 {
+            buf.get_u32()
+        } else {
+            crate::frame::DEFAULT_PRODUCE_TIMEOUT_MS
+        };
+        Ok(Self {
+            msg: ProduceFnf {
+                cluster,
+                topic,
+                key,
+                value,
+                partition,
+                timestamp_ms,
+                headers,
+            },
+            timeout_ms,
+        })
+    }
+}
 
 const RESP_OK: u8 = 0x00;
 const RESP_ERR: u8 = 0x01;
@@ -395,6 +446,24 @@ mod tests {
         original.encode(&mut buf).unwrap();
         let decoded = ProduceFnf::decode(&buf).unwrap();
         assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_produce_req_roundtrip_with_timeout() {
+        let original = ProduceReq {
+            msg: ProduceFnf {
+                cluster: "default".into(),
+                topic: "orders".into(),
+                key: Bytes::from_static(b"k"),
+                value: Bytes::from_static(b"v"),
+                headers: vec![("h".into(), Bytes::from_static(b"x"))],
+                ..Default::default()
+            },
+            timeout_ms: 1234,
+        };
+        let mut buf = BytesMut::new();
+        original.encode(&mut buf).unwrap();
+        assert_eq!(ProduceReq::decode(&buf).unwrap(), original);
     }
 
     #[test]

@@ -6,8 +6,24 @@ pub const HEADER_LEN: usize = 13;
 /// 单帧 payload 最大长度：16 MiB
 pub const MAX_PAYLOAD_LEN: usize = 16 * 1024 * 1024;
 
-/// 协议版本（major）
+/// 协议版本（major）。
+///
+/// 为什么保持 1：`ProduceReq` v2 尾部追加了 `u32 timeout_ms`，但**双向 decode
+/// 都做了 forward-compat 兼容**，滚动升级无需 bump major：
+///
+/// - v1 worker 收到 v2 扩展的 ProduceReq → `ProduceFnf::decode` 只读到 headers
+///   停下，尾部 4 字节静默忽略，用 worker 侧 librdkafka `message.timeout.ms` 默认
+/// - v2 worker 收到 v1 扩展的 ProduceReq → `ProduceReq::decode` 缺尾部 4 字节
+///   时 fallback 到 `DEFAULT_PRODUCE_TIMEOUT_MS`
+///
+/// 只有当 payload schema 出现**破坏性变更**（字段类型 / 顺序改变、语义反转）
+/// 才 bump major——否则一旦升，滚动升级期间 worker 与扩展互撞 HELLO 失败，
+/// 服务不可用。
 pub const PROTOCOL_MAJOR: u8 = 1;
+
+/// v1 扩展没有把 timeout_ms 写进 ProduceReq payload，v2 worker 解码到缺 4B 尾部
+/// 时使用这个默认值。与 `hi_kafka_produce_sync` 的 `timeoutMs` 缺省保持一致。
+pub const DEFAULT_PRODUCE_TIMEOUT_MS: u32 = 5000;
 
 /// 帧类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
