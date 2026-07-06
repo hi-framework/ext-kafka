@@ -126,8 +126,15 @@ try {
     $failed++;
 } catch (Hi\Kafka\KafkaException $e) {
     log_exc('scene3', $e);
-    // 允许 TXN_STATE / CLUSTER_NOT_REGISTERED / INVALID_ARGUMENT / INTERNAL 任一
-    $allowed = ['TXN_STATE', 'CLUSTER_NOT_REGISTERED', 'INVALID_ARGUMENT', 'INTERNAL'];
+    // 允许 NOT_TRANSACTIONAL / TXN_STATE / CLUSTER_NOT_REGISTERED / INVALID_ARGUMENT / INTERNAL 任一。
+    // NOT_TRANSACTIONAL 是 "cluster 无 transactional.id 时 begin" 的规范 ErrorKind。
+    $allowed = [
+        'NOT_TRANSACTIONAL',
+        'TXN_STATE',
+        'CLUSTER_NOT_REGISTERED',
+        'INVALID_ARGUMENT',
+        'INTERNAL',
+    ];
     if (\in_array($e->getKindName(), $allowed, true)) {
         echo "  ✓ kindName ∈ {" . \implode('|', $allowed) . '}' . \PHP_EOL;
         $passed++;
