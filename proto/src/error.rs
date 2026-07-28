@@ -4,9 +4,9 @@
 //! 载荷为 [`ErrorResp`]——让 PHP 侧拿到**机器可读**的 [`ErrorKind`] + retryable +
 //! 原生 librdkafka 码，而不是只能 `str_contains(message)` 猜。
 //!
-//! 线格式：
+//! v2 线格式：
 //! ```text
-//! [u16 kind][u8 retryable][i32 native_code][u16 msg_len][msg]
+//! [u16 kind][u8 retryable][u8 outcome][i32 native_code][u16 msg_len][msg]
 //! ```
 
 use crate::payload::PayloadError;
@@ -18,36 +18,30 @@ use bytes::{Buf, BufMut, BytesMut};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum ErrorKind {
-    /// 未分类 / worker 内部错误（含 panic 回退）
     Internal = 0,
-    /// worker 起不来 / 连不上 / 自动重试耗尽
-    WorkerUnavailable = 1,
-    /// IPC 或 broker 操作超时
-    Timeout = 2,
-    /// worker 正在停机，拒绝新请求
-    WorkerDraining = 3,
-    /// 协议错乱（版本不匹配 / 帧类型意外 / cid 不匹配 / 解码失败）
-    Protocol = 4,
-    /// 集群未注册（需先 registerCluster）
+    InvalidArgument = 1,
+    Protocol = 2,
+    FrameTooLarge = 3,
+    WorkerDraining = 4,
     ClusterNotRegistered = 5,
-    /// 调用参数非法（平行数组长度不一致 / 缺 bootstrap.servers / 非法 op 等）
-    InvalidArgument = 6,
-    /// 集群无 transactional.id，无法做事务操作
-    NotTransactional = 7,
-    /// subscription 不存在（通常被扩展端 virtual_id 自愈吸收）
-    SubscriptionNotFound = 8,
-    /// broker 可重试错（QueueFull / Leader 选举 / 网络 / 超时 等）
-    BrokerRetryable = 9,
-    /// 消息超过 broker / 协议大小上限
-    MessageTooLarge = 10,
-    /// SASL 认证 / ACL 授权失败（致命，重试无意义）
-    AuthnAuthz = 11,
-    /// offset / seek 目标非法（越界 / 无对应时间戳）
-    OffsetInvalid = 12,
-    /// 事务状态错（未 begin / 并发事务 / fenced 等）
-    TxnState = 13,
-    /// 未知 topic 或 partition
-    UnknownTopicOrPartition = 14,
+    SubscriptionNotFound = 6,
+    StaleEpoch = 7,
+    StaleDelivery = 8,
+    CreditExhausted = 9,
+    RecordTooLarge = 10,
+    Authentication = 11,
+    Authorization = 12,
+    Rebalance = 13,
+    Commit = 14,
+    ProducerQueueFull = 15,
+    Timeout = 16,
+    TransactionState = 17,
+    TransactionOwner = 18,
+    WorkerUnavailable = 19,
+    BrokerRetryable = 20,
+    UnknownTopicOrPartition = 21,
+    OffsetInvalid = 22,
+    NotTransactional = 23,
 }
 
 impl ErrorKind {
@@ -58,20 +52,29 @@ impl ErrorKind {
     /// 未知值映射为 `Internal`，保证前向兼容。
     pub fn from_u16(v: u16) -> Self {
         match v {
-            1 => Self::WorkerUnavailable,
-            2 => Self::Timeout,
-            3 => Self::WorkerDraining,
-            4 => Self::Protocol,
+            1 => Self::InvalidArgument,
+            2 => Self::Protocol,
+            3 => Self::FrameTooLarge,
+            4 => Self::WorkerDraining,
             5 => Self::ClusterNotRegistered,
-            6 => Self::InvalidArgument,
-            7 => Self::NotTransactional,
-            8 => Self::SubscriptionNotFound,
-            9 => Self::BrokerRetryable,
-            10 => Self::MessageTooLarge,
-            11 => Self::AuthnAuthz,
-            12 => Self::OffsetInvalid,
-            13 => Self::TxnState,
-            14 => Self::UnknownTopicOrPartition,
+            6 => Self::SubscriptionNotFound,
+            7 => Self::StaleEpoch,
+            8 => Self::StaleDelivery,
+            9 => Self::CreditExhausted,
+            10 => Self::RecordTooLarge,
+            11 => Self::Authentication,
+            12 => Self::Authorization,
+            13 => Self::Rebalance,
+            14 => Self::Commit,
+            15 => Self::ProducerQueueFull,
+            16 => Self::Timeout,
+            17 => Self::TransactionState,
+            18 => Self::TransactionOwner,
+            19 => Self::WorkerUnavailable,
+            20 => Self::BrokerRetryable,
+            21 => Self::UnknownTopicOrPartition,
+            22 => Self::OffsetInvalid,
+            23 => Self::NotTransactional,
             _ => Self::Internal,
         }
     }
@@ -88,20 +91,59 @@ impl ErrorKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Internal => "INTERNAL",
-            Self::WorkerUnavailable => "WORKER_UNAVAILABLE",
-            Self::Timeout => "TIMEOUT",
-            Self::WorkerDraining => "WORKER_DRAINING",
-            Self::Protocol => "PROTOCOL",
-            Self::ClusterNotRegistered => "CLUSTER_NOT_REGISTERED",
             Self::InvalidArgument => "INVALID_ARGUMENT",
-            Self::NotTransactional => "NOT_TRANSACTIONAL",
+            Self::Protocol => "PROTOCOL",
+            Self::FrameTooLarge => "FRAME_TOO_LARGE",
+            Self::WorkerDraining => "WORKER_DRAINING",
+            Self::ClusterNotRegistered => "CLUSTER_NOT_REGISTERED",
             Self::SubscriptionNotFound => "SUBSCRIPTION_NOT_FOUND",
+            Self::StaleEpoch => "STALE_EPOCH",
+            Self::StaleDelivery => "STALE_DELIVERY",
+            Self::CreditExhausted => "CREDIT_EXHAUSTED",
+            Self::RecordTooLarge => "RECORD_TOO_LARGE",
+            Self::Authentication => "AUTHENTICATION",
+            Self::Authorization => "AUTHORIZATION",
+            Self::Rebalance => "REBALANCE",
+            Self::Commit => "COMMIT",
+            Self::ProducerQueueFull => "PRODUCER_QUEUE_FULL",
+            Self::Timeout => "TIMEOUT",
+            Self::TransactionState => "TRANSACTION_STATE",
+            Self::TransactionOwner => "TRANSACTION_OWNER",
+            Self::WorkerUnavailable => "WORKER_UNAVAILABLE",
             Self::BrokerRetryable => "BROKER_RETRYABLE",
-            Self::MessageTooLarge => "MESSAGE_TOO_LARGE",
-            Self::AuthnAuthz => "AUTHN_AUTHZ",
-            Self::OffsetInvalid => "OFFSET_INVALID",
-            Self::TxnState => "TXN_STATE",
             Self::UnknownTopicOrPartition => "UNKNOWN_TOPIC_OR_PARTITION",
+            Self::OffsetInvalid => "OFFSET_INVALID",
+            Self::NotTransactional => "NOT_TRANSACTIONAL",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum OperationOutcome {
+    NotApplied = 0,
+    Applied = 1,
+    Unknown = 2,
+}
+
+impl OperationOutcome {
+    fn decode(tag: u8) -> Result<Self, PayloadError> {
+        match tag {
+            0 => Ok(Self::NotApplied),
+            1 => Ok(Self::Applied),
+            2 => Ok(Self::Unknown),
+            tag => Err(PayloadError::InvalidTag {
+                tag,
+                field: "operation_outcome",
+            }),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotApplied => "not_applied",
+            Self::Applied => "applied",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -111,6 +153,7 @@ impl ErrorKind {
 pub struct ErrorResp {
     pub kind: ErrorKind,
     pub retryable: bool,
+    pub outcome: OperationOutcome,
     /// 原生 librdkafka `rd_kafka_resp_err_t`（producer / consumer broker 错误）；无则 0。
     pub native_code: i32,
     pub message: String,
@@ -122,6 +165,7 @@ impl ErrorResp {
         Self {
             kind,
             retryable: kind.default_retryable(),
+            outcome: OperationOutcome::NotApplied,
             native_code: 0,
             message: message.into(),
         }
@@ -130,23 +174,26 @@ impl ErrorResp {
     pub fn encode(&self, buf: &mut BytesMut) -> Result<(), PayloadError> {
         buf.put_u16(self.kind.as_u16());
         buf.put_u8(self.retryable as u8);
+        buf.put_u8(self.outcome as u8);
         buf.put_i32(self.native_code);
         write_str_u16(&self.message, buf)?;
         Ok(())
     }
 
     pub fn decode(mut buf: &[u8]) -> Result<Self, PayloadError> {
-        // kind(2) + retryable(1) + native_code(4)
-        if buf.remaining() < 7 {
+        // kind(2) + retryable(1) + outcome(1) + native_code(4)
+        if buf.remaining() < 8 {
             return Err(PayloadError::Truncated);
         }
         let kind = ErrorKind::from_u16(buf.get_u16());
         let retryable = buf.get_u8() != 0;
+        let outcome = OperationOutcome::decode(buf.get_u8())?;
         let native_code = buf.get_i32();
         let message = read_str_u16(&mut buf, "error_message")?;
         Ok(Self {
             kind,
             retryable,
+            outcome,
             native_code,
             message,
         })
@@ -182,8 +229,9 @@ mod tests {
     #[test]
     fn test_error_resp_roundtrip() {
         let e = ErrorResp {
-            kind: ErrorKind::AuthnAuthz,
+            kind: ErrorKind::Authentication,
             retryable: false,
+            outcome: OperationOutcome::NotApplied,
             native_code: -167,
             message: "sasl auth failed".into(),
         };
@@ -197,6 +245,7 @@ mod tests {
         let mut buf = BytesMut::new();
         buf.put_u16(60000); // 未知 kind
         buf.put_u8(0);
+        buf.put_u8(0);
         buf.put_i32(0);
         buf.put_u16(0); // 空 message
         assert_eq!(ErrorResp::decode(&buf).unwrap().kind, ErrorKind::Internal);
@@ -208,7 +257,7 @@ mod tests {
             ErrorKind::Internal,
             ErrorKind::WorkerUnavailable,
             ErrorKind::BrokerRetryable,
-            ErrorKind::TxnState,
+            ErrorKind::TransactionState,
             ErrorKind::UnknownTopicOrPartition,
         ] {
             assert_eq!(ErrorKind::from_u16(k.as_u16()), k);
@@ -219,7 +268,7 @@ mod tests {
     fn test_default_retryable() {
         assert!(ErrorKind::Timeout.default_retryable());
         assert!(ErrorKind::WorkerUnavailable.default_retryable());
-        assert!(!ErrorKind::AuthnAuthz.default_retryable());
+        assert!(!ErrorKind::Authentication.default_retryable());
         assert!(!ErrorKind::InvalidArgument.default_retryable());
     }
 

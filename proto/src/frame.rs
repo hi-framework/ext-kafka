@@ -6,23 +6,11 @@ pub const HEADER_LEN: usize = 13;
 /// 单帧 payload 最大长度：16 MiB
 pub const MAX_PAYLOAD_LEN: usize = 16 * 1024 * 1024;
 
-/// 协议版本（major）。
-///
-/// 为什么保持 1：`ProduceReq` v2 尾部追加了 `u32 timeout_ms`，但**双向 decode
-/// 都做了 forward-compat 兼容**，滚动升级无需 bump major：
-///
-/// - v1 worker 收到 v2 扩展的 ProduceReq → `ProduceFnf::decode` 只读到 headers
-///   停下，尾部 4 字节静默忽略，用 worker 侧 librdkafka `message.timeout.ms` 默认
-/// - v2 worker 收到 v1 扩展的 ProduceReq → `ProduceReq::decode` 缺尾部 4 字节
-///   时 fallback 到 `DEFAULT_PRODUCE_TIMEOUT_MS`
-///
-/// 只有当 payload schema 出现**破坏性变更**（字段类型 / 顺序改变、语义反转）
-/// 才 bump major——否则一旦升，滚动升级期间 worker 与扩展互撞 HELLO 失败，
-/// 服务不可用。
-pub const PROTOCOL_MAJOR: u8 = 1;
+/// Protocol v2 is intentionally incompatible with the legacy batch consumer.
+/// A v1 worker/client pair must use its old socket and is never accepted here.
+pub const PROTOCOL_MAJOR: u8 = 2;
 
-/// v1 扩展没有把 timeout_ms 写进 ProduceReq payload，v2 worker 解码到缺 4B 尾部
-/// 时使用这个默认值。与 `hi_kafka_produce_sync` 的 `timeoutMs` 缺省保持一致。
+/// Default synchronous produce timeout used by public APIs before encoding.
 pub const DEFAULT_PRODUCE_TIMEOUT_MS: u32 = 5000;
 
 /// 帧类型
@@ -41,44 +29,10 @@ pub enum FrameType {
     ProduceReq = 0x11,
     /// Producer ACK 响应
     ProduceResp = 0x12,
-    /// 订阅请求
-    SubscribeReq = 0x20,
-    /// 订阅响应
-    SubscribeResp = 0x21,
-    /// 轮询拉取消息
-    PollReq = 0x22,
-    /// 轮询返回消息批次
-    PollResp = 0x23,
-    /// 提交 offset
-    CommitReq = 0x24,
-    /// 提交 offset 响应
-    CommitResp = 0x25,
-    /// 退订
-    Unsubscribe = 0x26,
     /// 注册/覆盖集群（cluster name + librdkafka 配置）
     RegisterClusterReq = 0x27,
     /// 注册响应
     RegisterClusterResp = 0x28,
-    /// 事务操作请求（begin/commit/abort）
-    TxnReq = 0x29,
-    /// 事务响应
-    TxnResp = 0x2A,
-    /// 拉取 rebalance 事件队列
-    PollRebalanceReq = 0x2B,
-    /// rebalance 事件队列响应
-    PollRebalanceResp = 0x2C,
-    /// Seek 请求（按 offset / timestamp）
-    SeekReq = 0x2D,
-    /// Seek 响应
-    SeekResp = 0x2E,
-    /// 把 consumer offsets 提交到 producer 当前事务（exactly-once stream）
-    SendOffsetsReq = 0x31,
-    /// 上面操作的响应
-    SendOffsetsResp = 0x32,
-    /// Pause / Resume per-partition（细粒度背压）
-    PauseResumeReq = 0x33,
-    /// Pause / Resume 响应
-    PauseResumeResp = 0x34,
     /// 推送 SASL/OAUTHBEARER token 给指定 cluster
     SetOAuthBearerTokenReq = 0x35,
     /// SetOAuthBearerToken 响应
@@ -93,6 +47,32 @@ pub enum FrameType {
     /// worker 收到后若此连接关闭即成最后一个连接且无活跃订阅，则立即自退，
     /// 不必等 idle 超时。发送失败 / worker 已死 → 退化回 idle 自退。
     Goodbye = 0x42,
+    /// v2 Consumer：建立专用 stream。
+    ConsumeOpen = 0x50,
+    /// v2 Consumer：stream 建立/恢复成功。
+    ConsumeReady = 0x51,
+    /// v2 Consumer：在恢复租约内重建 stream。
+    ConsumeResume = 0x52,
+    /// v2 Consumer：单条 record delivery。
+    ConsumeMessage = 0x53,
+    /// v2 Consumer：应用成功处理 delivery。
+    ConsumeAck = 0x54,
+    /// v2 Consumer：应用处理 delivery 失败。
+    ConsumeNack = 0x55,
+    /// v2 Consumer：提交连续 ACK watermark。
+    ConsumeCommit = 0x56,
+    /// v2 Consumer：返回实际提交的 next offsets。
+    ConsumeCommitted = 0x57,
+    /// v2 Consumer：assignment 生效通知。
+    RebalanceAssign = 0x58,
+    /// v2 Consumer：partition revoke 通知。
+    RebalanceRevoke = 0x59,
+    /// v2 Consumer：正常或异常关闭 stream。
+    ConsumeClose = 0x5A,
+    /// v2 Consumer：暂停指定 assignment partitions。
+    ConsumePause = 0x5B,
+    /// v2 Consumer：恢复指定 assignment partitions。
+    ConsumePartitionResume = 0x5C,
 }
 
 impl FrameType {
@@ -104,31 +84,27 @@ impl FrameType {
             0x10 => Self::ProduceFnf,
             0x11 => Self::ProduceReq,
             0x12 => Self::ProduceResp,
-            0x20 => Self::SubscribeReq,
-            0x21 => Self::SubscribeResp,
-            0x22 => Self::PollReq,
-            0x23 => Self::PollResp,
-            0x24 => Self::CommitReq,
-            0x25 => Self::CommitResp,
-            0x26 => Self::Unsubscribe,
             0x27 => Self::RegisterClusterReq,
             0x28 => Self::RegisterClusterResp,
-            0x29 => Self::TxnReq,
-            0x2A => Self::TxnResp,
-            0x2B => Self::PollRebalanceReq,
-            0x2C => Self::PollRebalanceResp,
-            0x2D => Self::SeekReq,
-            0x2E => Self::SeekResp,
-            0x31 => Self::SendOffsetsReq,
-            0x32 => Self::SendOffsetsResp,
-            0x33 => Self::PauseResumeReq,
-            0x34 => Self::PauseResumeResp,
             0x35 => Self::SetOAuthBearerTokenReq,
             0x36 => Self::SetOAuthBearerTokenResp,
             0x30 => Self::FlowControl,
             0x40 => Self::Error,
             0x41 => Self::ShutdownNotice,
             0x42 => Self::Goodbye,
+            0x50 => Self::ConsumeOpen,
+            0x51 => Self::ConsumeReady,
+            0x52 => Self::ConsumeResume,
+            0x53 => Self::ConsumeMessage,
+            0x54 => Self::ConsumeAck,
+            0x55 => Self::ConsumeNack,
+            0x56 => Self::ConsumeCommit,
+            0x57 => Self::ConsumeCommitted,
+            0x58 => Self::RebalanceAssign,
+            0x59 => Self::RebalanceRevoke,
+            0x5A => Self::ConsumeClose,
+            0x5B => Self::ConsumePause,
+            0x5C => Self::ConsumePartitionResume,
             _ => return None,
         })
     }

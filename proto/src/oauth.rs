@@ -1,4 +1,4 @@
-//! 推送 SASL/OAUTHBEARER token（Phase 3.17）。
+//! 推送 SASL/OAUTHBEARER token。
 //!
 //! ## 背景
 //!

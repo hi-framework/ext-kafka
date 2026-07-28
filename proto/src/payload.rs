@@ -1,4 +1,4 @@
-//! MVP payload 编解码。
+//! Producer 与 handshake payload 编解码。
 //!
 //! 在引入 protobuf 之前用最小手写格式承载消息。所有长度均为大端。
 //!
@@ -15,7 +15,7 @@
 //! - `partition`：`-1` = 让 librdkafka 用 partitioner 决定（典型 key hash），其它值
 //!   指定写入分区（key 仍透传，但路由由用户控制）
 //! - `timestamp_ms`：`-1` = librdkafka 用 CreateTime（系统当前时间）
-//! - `headers`：见 Phase 3.1，空数组编码为 `[0u32]`
+//! - `headers`：空数组编码为 `[0u32]`
 //!
 //! ## PRODUCE_REQ v1
 //!
@@ -59,8 +59,35 @@ pub type MessageHeader = (String, Bytes);
 /// `-1` 表示 librdkafka 决定（auto）。其它非负值为显式指定。
 pub const AUTO_PARTITION: i32 = -1;
 pub const AUTO_TIMESTAMP: i64 = -1;
+pub const MAX_MESSAGE_HEADERS: usize = 4_096;
 
-/// HELLO 帧 payload：仅 `[u8 major]`。
+pub const CAP_PRODUCER: u64 = 1 << 0;
+pub const CAP_CONSUMER_STREAM: u64 = 1 << 1;
+pub const CAP_ALL: u64 = CAP_PRODUCER | CAP_CONSUMER_STREAM;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ConnectionRole {
+    Rpc = 0,
+    ConsumerStream = 1,
+    Lifecycle = 2,
+}
+
+impl ConnectionRole {
+    fn decode(tag: u8) -> Result<Self, PayloadError> {
+        match tag {
+            0 => Ok(Self::Rpc),
+            1 => Ok(Self::ConsumerStream),
+            2 => Ok(Self::Lifecycle),
+            tag => Err(PayloadError::InvalidTag {
+                tag,
+                field: "connection_role",
+            }),
+        }
+    }
+}
+
+/// HELLO v2 payload: `[u8 major][u8 role][u64 capabilities]`.
 ///
 /// 协议握手语义：扩展端每条新建 UDS 连接的第一帧必须是 HELLO，并带上扩展
 /// 自身编译的 `PROTOCOL_MAJOR`。worker 收到后校验 major 与自身一致，一致
@@ -74,38 +101,53 @@ pub const AUTO_TIMESTAMP: i64 = -1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HelloReq {
     pub major: u8,
+    pub role: ConnectionRole,
+    pub capabilities: u64,
 }
 
 impl HelloReq {
     pub fn encode(&self, buf: &mut BytesMut) -> Result<(), PayloadError> {
         buf.put_u8(self.major);
+        buf.put_u8(self.role as u8);
+        buf.put_u64(self.capabilities);
         Ok(())
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, PayloadError> {
-        if buf.is_empty() {
+        if buf.remaining() < 10 {
             return Err(PayloadError::Truncated);
         }
-        Ok(Self { major: buf[0] })
+        let mut buf = buf;
+        Ok(Self {
+            major: buf.get_u8(),
+            role: ConnectionRole::decode(buf.get_u8())?,
+            capabilities: buf.get_u64(),
+        })
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HelloResp {
     pub major: u8,
+    pub capabilities: u64,
 }
 
 impl HelloResp {
     pub fn encode(&self, buf: &mut BytesMut) -> Result<(), PayloadError> {
         buf.put_u8(self.major);
+        buf.put_u64(self.capabilities);
         Ok(())
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, PayloadError> {
-        if buf.is_empty() {
+        if buf.remaining() < 9 {
             return Err(PayloadError::Truncated);
         }
-        Ok(Self { major: buf[0] })
+        let mut buf = buf;
+        Ok(Self {
+            major: buf.get_u8(),
+            capabilities: buf.get_u64(),
+        })
     }
 }
 
@@ -175,7 +217,7 @@ pub(crate) fn write_headers(
     headers: &[MessageHeader],
     buf: &mut BytesMut,
 ) -> Result<(), PayloadError> {
-    if headers.len() > u32::MAX as usize {
+    if headers.len() > MAX_MESSAGE_HEADERS {
         return Err(PayloadError::FieldTooLarge(headers.len()));
     }
     buf.put_u32(headers.len() as u32);
@@ -191,7 +233,10 @@ pub(crate) fn read_headers(buf: &mut &[u8]) -> Result<Vec<MessageHeader>, Payloa
         return Err(PayloadError::Truncated);
     }
     let n = buf.get_u32() as usize;
-    let mut headers = Vec::with_capacity(n.min(1024));
+    if n > MAX_MESSAGE_HEADERS {
+        return Err(PayloadError::FieldTooLarge(n));
+    }
+    let mut headers = Vec::with_capacity(n);
     for _ in 0..n {
         let name = read_str_u16(buf, "header_name")?;
         let value = read_bytes_u32(buf)?;
@@ -224,14 +269,12 @@ impl ProduceReq {
         let partition = buf.get_i32();
         let timestamp_ms = buf.get_i64();
         let headers = read_headers(&mut buf)?;
-        // Forward-compat：v1 扩展没写尾部 timeout_ms → 用默认，不认为是错。
-        // 这让新 worker 能吃老扩展帧，配合 frame.rs 中"PROTOCOL_MAJOR 保持 1"支持
-        // 滚动升级期间双向兼容。
-        let timeout_ms = if buf.remaining() >= 4 {
-            buf.get_u32()
-        } else {
-            crate::frame::DEFAULT_PRODUCE_TIMEOUT_MS
-        };
+        // v2 is destructive: a missing timeout is malformed, never a request
+        // to silently apply a v1 default.
+        if buf.remaining() < 4 {
+            return Err(PayloadError::Truncated);
+        }
+        let timeout_ms = buf.get_u32();
         Ok(Self {
             msg: ProduceFnf {
                 cluster,
@@ -369,6 +412,38 @@ fn read_bytes_u32(buf: &mut &[u8]) -> Result<Bytes, PayloadError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hello_v2_roundtrip_includes_role_and_capabilities() {
+        let request = HelloReq {
+            major: crate::PROTOCOL_MAJOR,
+            role: ConnectionRole::ConsumerStream,
+            capabilities: CAP_ALL,
+        };
+        let mut buf = BytesMut::new();
+        request.encode(&mut buf).unwrap();
+        assert_eq!(HelloReq::decode(&buf).unwrap(), request);
+
+        let response = HelloResp {
+            major: crate::PROTOCOL_MAJOR,
+            capabilities: CAP_ALL,
+        };
+        let mut buf = BytesMut::new();
+        response.encode(&mut buf).unwrap();
+        assert_eq!(HelloResp::decode(&buf).unwrap(), response);
+    }
+
+    #[test]
+    fn hello_v2_rejects_legacy_single_byte_payload() {
+        assert!(matches!(
+            HelloReq::decode(&[1]),
+            Err(PayloadError::Truncated)
+        ));
+        assert!(matches!(
+            HelloResp::decode(&[1]),
+            Err(PayloadError::Truncated)
+        ));
+    }
 
     #[test]
     fn test_produce_fnf_roundtrip() {

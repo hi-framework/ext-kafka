@@ -1,4 +1,4 @@
-//! Hi-Kafka IPC protocol v1.
+//! Hi-Kafka IPC protocol v2.
 //!
 //! 帧格式：
 //! ```text
@@ -14,34 +14,28 @@
 //! - `cid`: correlation id，0 表示单向无应答帧
 //! - `payload`: 帧体（按 type 解释）
 
+pub mod cluster;
 pub mod codec;
-pub mod consumer;
 pub mod error;
 pub mod frame;
 pub mod oauth;
-pub mod pause_resume;
 pub mod payload;
-pub mod rebalance;
-pub mod seek;
-pub mod send_offsets;
-pub mod txn;
+pub mod stream;
 
+pub use cluster::{RegisterClusterReq, RegisterClusterResp};
 pub use codec::{decode_header, encode_frame, CodecError, Header};
-pub use consumer::{
-    CommitReq, CommitResp, ConsumerMessage, PollReq, PollResp, RegisterClusterReq,
-    RegisterClusterResp, SubscribeReq, SubscribeResp, UnsubscribeReq,
-};
-pub use error::{ErrorKind, ErrorResp};
+pub use error::{ErrorKind, ErrorResp, OperationOutcome};
 pub use frame::{
     Frame, FrameType, DEFAULT_PRODUCE_TIMEOUT_MS, HEADER_LEN, MAX_PAYLOAD_LEN, PROTOCOL_MAJOR,
 };
 pub use oauth::{SetOAuthBearerTokenReq, SetOAuthBearerTokenResp};
-pub use pause_resume::{PauseResumeOp, PauseResumeReq, PauseResumeResp};
 pub use payload::{
-    DeliveryAck, DeliveryErr, HelloReq, HelloResp, MessageHeader, PayloadError, ProduceFnf,
-    ProduceReq, ProduceResp, AUTO_PARTITION, AUTO_TIMESTAMP,
+    ConnectionRole, DeliveryAck, DeliveryErr, HelloReq, HelloResp, MessageHeader, PayloadError,
+    ProduceFnf, ProduceReq, ProduceResp, AUTO_PARTITION, AUTO_TIMESTAMP, CAP_ALL,
+    CAP_CONSUMER_STREAM, CAP_PRODUCER, MAX_MESSAGE_HEADERS,
 };
-pub use rebalance::{PollRebalanceReq, PollRebalanceResp, RebalanceEvent};
-pub use seek::{OffsetSpec, PartitionSpec, SeekReq, SeekResp};
-pub use send_offsets::{OffsetCommit, SendOffsetsReq, SendOffsetsResp};
-pub use txn::{TxnOp, TxnReq, TxnResp};
+pub use stream::{
+    CommittedOffset, ConsumeAck, ConsumeClose, ConsumeCommit, ConsumeCommitted, ConsumeMessage,
+    ConsumeNack, ConsumeOpen, ConsumeReady, ConsumeResume, ConsumerPartitions, FlowControl,
+    RebalanceNotice, ResumeToken, RESUME_TOKEN_LEN,
+};
