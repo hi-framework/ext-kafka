@@ -14,9 +14,11 @@ pub mod metrics;
 pub mod producer;
 pub mod server;
 pub mod shutdown;
+pub mod stream_core;
+pub mod watermark;
 
 pub use cluster::{ClusterConfig, ClusterRegistry, ClusterRegistryHandle};
-pub use consumer::{Consumer, ConsumerError, ConsumerHandle, LoggingConsumer, SubscriptionId};
+pub use consumer::{ConsumerError, ConsumerHandle, ConsumerManager};
 pub use error::WorkerError;
 pub use metrics::Metrics;
 pub use producer::{LoggingProducer, Producer, ProducerHandle};

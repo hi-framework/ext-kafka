@@ -8,8 +8,8 @@
 //! refresh 回调时 worker 的 `ClientContext::generate_oauth_bearer_token`
 //! 直接读 slot 返回。token 缺失时 librdkafka 会按其自身的退避策略重试。
 //!
-//! 不再依赖启动参数 `--brokers` 或环境变量 `HI_KAFKA_BROKERS`
-//! 作为主路径——业务由 PHP 完全控制。
+//! 不存在启动参数或环境变量 broker fallback；业务必须通过协议显式注册，
+//! Cluster Registry 是唯一权威配置源。
 
 use std::collections::HashMap;
 use std::sync::Arc;

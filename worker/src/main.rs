@@ -14,17 +14,12 @@ use tracing_subscriber::EnvFilter;
 #[command(name = "hi-kafka-worker", version)]
 struct Cli {
     /// Unix socket 监听路径
-    #[arg(long, env = "HI_KAFKA_SOCKET", default_value = "/tmp/hi-kafka.sock")]
+    #[arg(long, env = "HI_KAFKA_SOCKET", default_value = "/tmp/hi-kafka-v2.sock")]
     socket: PathBuf,
 
     /// 日志级别
     #[arg(long, env = "HI_KAFKA_LOG_LEVEL", default_value = "info")]
     log_level: String,
-
-    /// 默认集群的 broker 列表（逗号分隔）。仅在编译时启用 `kafka` feature 才生效。
-    /// 不指定则使用 LoggingProducer（dry-run，不投递）。
-    #[arg(long, env = "HI_KAFKA_BROKERS")]
-    brokers: Option<String>,
 
     /// 收到 SIGTERM/SIGINT 后 drain 在途消息的最大等待时间（毫秒）
     #[arg(long, env = "HI_KAFKA_DRAIN_TIMEOUT_MS", default_value_t = 10_000)]
@@ -57,16 +52,10 @@ async fn main() -> anyhow::Result<()> {
     let mut sig_int = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
 
     let registry = ClusterRegistry::new();
-    if let Some(brokers) = cli.brokers.as_deref() {
-        let mut cfg = std::collections::HashMap::new();
-        cfg.insert("bootstrap.servers".to_string(), brokers.to_string());
-        registry.register("default".to_string(), cfg).await;
-        info!(%brokers, "preregistered 'default' cluster from --brokers");
-    }
     let producer = build_producer(registry.clone());
     let shutdown = ShutdownState::new();
     let m = Metrics::new();
-    let consumer = build_consumer(registry.clone(), m.clone());
+    let consumer = build_consumer(registry.clone(), shutdown.clone(), m.clone());
 
     if !cli.metrics_addr.is_empty() {
         match cli.metrics_addr.parse::<SocketAddr>() {
@@ -158,17 +147,17 @@ fn build_producer(
 #[cfg(feature = "kafka")]
 fn build_consumer(
     registry: hi_kafka_worker::ClusterRegistryHandle,
+    shutdown: hi_kafka_worker::ShutdownHandle,
     metrics: std::sync::Arc<hi_kafka_worker::Metrics>,
 ) -> hi_kafka_worker::ConsumerHandle {
-    use hi_kafka_worker::consumer::{KafkaConsumer, KafkaConsumerConfig};
-    use std::sync::Arc;
-    Arc::new(KafkaConsumer::new(registry, KafkaConsumerConfig::default()).with_metrics(metrics))
+    hi_kafka_worker::consumer::kafka(registry, shutdown, metrics)
 }
 
 #[cfg(not(feature = "kafka"))]
 fn build_consumer(
     _registry: hi_kafka_worker::ClusterRegistryHandle,
-    _metrics: std::sync::Arc<hi_kafka_worker::Metrics>,
+    shutdown: hi_kafka_worker::ShutdownHandle,
+    metrics: std::sync::Arc<hi_kafka_worker::Metrics>,
 ) -> hi_kafka_worker::ConsumerHandle {
-    hi_kafka_worker::consumer::logging()
+    hi_kafka_worker::consumer::logging(shutdown, metrics)
 }

@@ -1,7 +1,6 @@
 //! 极简 Prometheus 指标收集 + HTTP 暴露。
 //!
-//! Phase 2.7 MVP：手写 counter，无外部 metrics 框架。后续若需要 histogram/summary
-//! 再切到 `prometheus` crate。
+//! 使用固定、低基数的原子 counter/gauge，避免 metrics 自身成为内存增长源。
 //!
 //! HTTP 协议层只识别 `GET /metrics`，其余路径一律 404。无 Keep-Alive、无 TLS、
 //! 不解析 header，只读到第一个 `\r\n` 就响应。
@@ -28,13 +27,20 @@ pub struct Metrics {
 
     pub frames_dropped_draining_total: AtomicU64,
 
-    // J: Consumer 背压指标——跨 subscription 求和（不带 label）。
-    // per-subscription 粒度仍可通过 `KafkaConsumer::backpressure_stats()` API 在
-    // 业务侧排障使用；这些 counter 是给 Prometheus 长期趋势监控的。
+    pub consumer_open_total: AtomicU64,
+    pub consumer_resume_stream_total: AtomicU64,
+    pub consumer_messages_total: AtomicU64,
+    pub consumer_acked_total: AtomicU64,
+    pub consumer_nacked_total: AtomicU64,
+    pub consumer_commit_total: AtomicU64,
+    pub consumer_rebalance_assign_total: AtomicU64,
+    pub consumer_rebalance_revoke_total: AtomicU64,
     pub consumer_pause_total: AtomicU64,
     pub consumer_resume_total: AtomicU64,
-    pub consumer_messages_dropped_total: AtomicU64,
     pub consumer_stream_errors_total: AtomicU64,
+    pub consumer_active: AtomicU64,
+    pub consumer_in_flight_messages: AtomicU64,
+    pub consumer_in_flight_bytes: AtomicU64,
 
     started_at: once_cell::sync::OnceCell<Instant>,
 }
@@ -48,6 +54,17 @@ impl Metrics {
 
     pub fn inc(counter: &AtomicU64) {
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn add(counter: &AtomicU64, value: u64) {
+        counter.fetch_add(value, Ordering::Relaxed);
+    }
+
+    pub fn sub(counter: &AtomicU64, value: u64) {
+        let result = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_sub(value))
+        });
+        debug_assert!(result.is_ok());
     }
 
     pub fn uptime_seconds(&self) -> u64 {
@@ -128,25 +145,82 @@ impl Metrics {
         );
 
         emit_counter!(
+            "hi_kafka_consumer_open_total",
+            "Consumer streams opened",
+            consumer_open_total
+        );
+        emit_counter!(
+            "hi_kafka_consumer_resume_stream_total",
+            "Consumer streams resumed after disconnect",
+            consumer_resume_stream_total
+        );
+        emit_counter!(
+            "hi_kafka_consumer_messages_total",
+            "Single-record deliveries sent",
+            consumer_messages_total
+        );
+        emit_counter!(
+            "hi_kafka_consumer_acked_total",
+            "Deliveries acknowledged",
+            consumer_acked_total
+        );
+        emit_counter!(
+            "hi_kafka_consumer_nacked_total",
+            "Deliveries negatively acknowledged",
+            consumer_nacked_total
+        );
+        emit_counter!(
+            "hi_kafka_consumer_commit_total",
+            "Exact watermark commits completed",
+            consumer_commit_total
+        );
+        emit_counter!(
+            "hi_kafka_consumer_rebalance_assign_total",
+            "Assignment notices",
+            consumer_rebalance_assign_total
+        );
+        emit_counter!(
+            "hi_kafka_consumer_rebalance_revoke_total",
+            "Revoke notices",
+            consumer_rebalance_revoke_total
+        );
+        emit_counter!(
             "hi_kafka_consumer_pause_total",
-            "Total auto-pause transitions triggered by backpressure (sum across subscriptions)",
+            "Explicit partition pause operations",
             consumer_pause_total
         );
         emit_counter!(
             "hi_kafka_consumer_resume_total",
-            "Total auto-resume transitions after backpressure relief (sum across subscriptions)",
+            "Explicit partition resume operations",
             consumer_resume_total
         );
         emit_counter!(
-            "hi_kafka_consumer_messages_dropped_total",
-            "Total consumer messages dropped due to hard buffer overflow (sum across subscriptions)",
-            consumer_messages_dropped_total
-        );
-        emit_counter!(
             "hi_kafka_consumer_stream_errors_total",
-            "Total rdkafka stream errors fatal+non-fatal (sum across subscriptions)",
+            "Consumer stream failures",
             consumer_stream_errors_total
         );
+
+        for (name, help, value) in [
+            (
+                "hi_kafka_consumer_active",
+                "Active subscription actors",
+                self.consumer_active.load(Ordering::Relaxed),
+            ),
+            (
+                "hi_kafka_consumer_in_flight_messages",
+                "Owned in-flight deliveries",
+                self.consumer_in_flight_messages.load(Ordering::Relaxed),
+            ),
+            (
+                "hi_kafka_consumer_in_flight_bytes",
+                "Owned in-flight delivery bytes",
+                self.consumer_in_flight_bytes.load(Ordering::Relaxed),
+            ),
+        ] {
+            s.push_str(&format!(
+                "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}\n"
+            ));
+        }
 
         s
     }
@@ -221,20 +295,17 @@ mod tests {
         Metrics::inc(&m.consumer_pause_total);
         Metrics::inc(&m.consumer_pause_total);
         Metrics::inc(&m.consumer_resume_total);
-        Metrics::inc(&m.consumer_messages_dropped_total);
         Metrics::inc(&m.consumer_stream_errors_total);
         Metrics::inc(&m.consumer_stream_errors_total);
         Metrics::inc(&m.consumer_stream_errors_total);
         let text = m.to_prometheus_text();
         assert!(text.contains("hi_kafka_consumer_pause_total 2"));
         assert!(text.contains("hi_kafka_consumer_resume_total 1"));
-        assert!(text.contains("hi_kafka_consumer_messages_dropped_total 1"));
         assert!(text.contains("hi_kafka_consumer_stream_errors_total 3"));
-        // 4 个 counter 都应有 # TYPE 元行
+        // Every exported counter has a # TYPE metadata line.
         for c in [
             "hi_kafka_consumer_pause_total",
             "hi_kafka_consumer_resume_total",
-            "hi_kafka_consumer_messages_dropped_total",
             "hi_kafka_consumer_stream_errors_total",
         ] {
             assert!(

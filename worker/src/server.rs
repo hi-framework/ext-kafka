@@ -1,5 +1,5 @@
 use crate::cluster::{ClusterRegistryHandle, StoredOAuthToken};
-use crate::consumer::{ConsumerError, ConsumerHandle, SubscriptionId};
+use crate::consumer::{ConsumerError, ConsumerHandle, OutboundFrame};
 use crate::error::WorkerError;
 use crate::metrics::Metrics;
 use crate::producer::ProducerHandle;
@@ -8,14 +8,13 @@ use anyhow::Context;
 use bytes::BytesMut;
 use futures::FutureExt;
 use hi_kafka_proto::{
-    codec, encode_frame, CommitReq, CommitResp, DeliveryAck, ErrorKind, ErrorResp, FrameType,
-    HelloReq, HelloResp,
-    PauseResumeOp, PauseResumeReq, PauseResumeResp, PollRebalanceReq, PollRebalanceResp, PollReq,
-    PollResp, ProduceFnf, ProduceReq, ProduceResp, RegisterClusterReq, RegisterClusterResp,
-    SeekReq, SeekResp, SendOffsetsReq, SendOffsetsResp, SetOAuthBearerTokenReq,
-    SetOAuthBearerTokenResp, SubscribeReq, SubscribeResp, TxnOp, TxnReq, TxnResp, UnsubscribeReq,
-    HEADER_LEN, PROTOCOL_MAJOR,
+    codec, encode_frame, ConnectionRole, ConsumeAck, ConsumeClose, ConsumeCommit, ConsumeNack,
+    ConsumeOpen, ConsumeResume, ConsumerPartitions, DeliveryAck, ErrorKind, ErrorResp, FlowControl,
+    FrameType, HelloReq, HelloResp, ProduceFnf, ProduceReq, ProduceResp, RegisterClusterReq,
+    RegisterClusterResp, SetOAuthBearerTokenReq, SetOAuthBearerTokenResp, CAP_ALL,
+    CAP_CONSUMER_STREAM, HEADER_LEN, MAX_PAYLOAD_LEN, PROTOCOL_MAJOR,
 };
+use std::io::IoSlice;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,6 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
@@ -41,13 +41,15 @@ pub struct Server {
 impl Server {
     pub async fn bind(socket: &Path) -> anyhow::Result<Self> {
         let registry = crate::cluster::ClusterRegistry::new();
+        let shutdown = crate::shutdown::ShutdownState::new();
+        let metrics = Metrics::new();
         Self::bind_with(
             socket,
             crate::producer::logging(),
-            crate::consumer::logging(),
+            crate::consumer::logging(shutdown.clone(), metrics.clone()),
             registry,
-            crate::shutdown::ShutdownState::new(),
-            Metrics::new(),
+            shutdown,
+            metrics,
             Duration::ZERO,
         )
         .await
@@ -153,7 +155,7 @@ impl Server {
                     reap_finished(&mut tasks);
                     if expedited.load(Ordering::Acquire)
                         && tasks.is_empty()
-                        && self.consumer.active_subscriptions(idle_timeout) == 0
+                        && self.consumer.active_subscriptions().await == 0
                     {
                         info!("client goodbye + last connection closed, self-terminating");
                         self.shutdown.start_draining();
@@ -163,17 +165,9 @@ impl Server {
                     // 清掉已结束的 connection task，才能准确判断"无连接"。
                     reap_finished(&mut tasks);
                     if tasks.is_empty() {
-                        // 无连接。是否还有「近期活跃」订阅（idle_timeout 内 poll 过）？
-                        // 后者保护后台 consumer：仍在 poll 的订阅持有 offset 进度 / group
-                        // 成员资格，不能被 idle 退误杀（否则触发不必要的 rebalance 抖动）。
-                        // 只看「近期活跃」——owner 已死、没 unsubscribe 的泄漏订阅在
-                        // idle_timeout 内无 poll 即不再计数，放行自退（修复孤儿残留）。
-                        //
-                        // 关键：有活跃订阅时**不刷新 last_active**，让订阅 staleness 与连接侧
-                        // last_active 共用同一个 idle_timeout 到期点。否则订阅转 stale 后
-                        // last_active 还停在「刚才」，要再等一个完整 idle_timeout 才退（双倍）。
-                        let has_active_subs =
-                            self.consumer.active_subscriptions(idle_timeout) > 0;
+                        // Dedicated stream 断开后 actor 只保留到 resume grace；仍 attached
+                        // 或仍在 grace 内的 subscription 是活跃资源，不能被 idle 退出误杀。
+                        let has_active_subs = self.consumer.active_subscriptions().await > 0;
                         if !has_active_subs && last_active.elapsed() >= idle_timeout {
                             info!(
                                 ?idle_timeout,
@@ -226,14 +220,14 @@ fn check_per_frame_limit(kind: FrameType, payload_len: u32) -> anyhow::Result<()
     // 单条业务消息（key + value + headers）上限：4 MiB
     // ——Kafka broker 默认 message.max.bytes 1 MiB，留 4× 余量给 headers / 大 value
     const PRODUCE_MAX: u32 = 4 * 1024 * 1024;
-    // poll 一批消息回 PHP：上限 8 MiB（多条聚合）
-    const POLL_RESP_MAX: u32 = 8 * 1024 * 1024;
     // 控制帧（注册集群、订阅、提交、事务、OAuth token 等）：64 KiB 足矣
     const CONTROL_MAX: u32 = 64 * 1024;
 
     let limit = match kind {
-        FrameType::ProduceFnf | FrameType::ProduceReq | FrameType::ProduceResp => PRODUCE_MAX,
-        FrameType::PollResp => POLL_RESP_MAX,
+        FrameType::ProduceFnf
+        | FrameType::ProduceReq
+        | FrameType::ProduceResp
+        | FrameType::ConsumeMessage => PRODUCE_MAX,
         // 其余全部按控制帧
         _ => CONTROL_MAX,
     };
@@ -271,6 +265,7 @@ async fn handle_connection(
     // F: 第一帧必须是 HELLO 且 PROTOCOL_MAJOR 与 worker 自身一致；
     // 否则关连接（让客户端 read 端 EOF → pool 视为 connect 失败，重试）
     let mut handshaked = false;
+    let mut connection_role = None;
 
     loop {
         if let Err(e) = stream.read_exact(&mut header_buf).await {
@@ -326,15 +321,43 @@ async fn handle_connection(
                     PROTOCOL_MAJOR
                 );
             }
+            if hello.role == ConnectionRole::ConsumerStream
+                && hello.capabilities & CAP_CONSUMER_STREAM == 0
+            {
+                anyhow::bail!("consumer stream role without consumer-stream capability");
+            }
             let resp = HelloResp {
                 major: PROTOCOL_MAJOR,
+                capabilities: CAP_ALL,
             };
             let mut resp_buf = BytesMut::new();
             resp.encode(&mut resp_buf).context("encode HELLO resp")?;
             write_frame(&mut stream, FrameType::Hello, header.cid, &resp_buf).await?;
             handshaked = true;
-            debug!(cid = header.cid, "HELLO handshake ok");
+            connection_role = Some(hello.role);
+            debug!(cid = header.cid, role = ?hello.role, "HELLO handshake ok");
+            if hello.role == ConnectionRole::ConsumerStream {
+                return handle_consumer_stream(stream, consumer, metrics).await;
+            }
             continue;
+        }
+
+        if matches!(
+            header.kind,
+            FrameType::ConsumeOpen
+                | FrameType::ConsumeResume
+                | FrameType::ConsumeAck
+                | FrameType::ConsumeNack
+                | FrameType::ConsumeCommit
+                | FrameType::ConsumeClose
+                | FrameType::FlowControl
+        ) && connection_role != Some(ConnectionRole::ConsumerStream)
+        {
+            anyhow::bail!(
+                "consumer stream frame {:?} received on {:?} connection",
+                header.kind,
+                connection_role
+            );
         }
 
         dispatch(
@@ -351,6 +374,212 @@ async fn handle_connection(
         )
         .await?;
     }
+}
+
+/// Dedicated, full-duplex Consumer v2 session.  It never enters the RPC
+/// dispatcher and therefore cannot be head-of-line blocked by ProduceSync.
+async fn handle_consumer_stream(
+    stream: UnixStream,
+    consumer: ConsumerHandle,
+    metrics: Arc<Metrics>,
+) -> anyhow::Result<()> {
+    let (mut reader, mut writer) = stream.into_split();
+    let mut inbound_payload = BytesMut::new();
+    let first = read_wire_frame(&mut reader, &mut inbound_payload)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!("consumer stream closed before ConsumeOpen/ConsumeResume")
+        })?;
+    let (outbound_tx, mut outbound_rx) =
+        mpsc::channel::<OutboundFrame>(consumer.outbound_capacity());
+
+    let ready = match first.kind {
+        FrameType::ConsumeOpen => match ConsumeOpen::decode(&inbound_payload) {
+            Ok(request) => consumer.open(request, outbound_tx).await,
+            Err(error) => Err(ConsumerError::InvalidArgument(error.to_string())),
+        },
+        FrameType::ConsumeResume => match ConsumeResume::decode(&inbound_payload) {
+            Ok(request) => consumer.resume(request, outbound_tx).await,
+            Err(error) => Err(ConsumerError::InvalidArgument(error.to_string())),
+        },
+        other => {
+            write_error_half(
+                &mut writer,
+                first.cid,
+                ErrorResp::new(
+                    ErrorKind::Protocol,
+                    format!(
+                        "first consumer frame must be ConsumeOpen/ConsumeResume, got {other:?}"
+                    ),
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let attachment = match ready {
+        Ok(value) => value,
+        Err(error) => {
+            write_error_half(&mut writer, first.cid, consumer_err_to_resp(&error)).await?;
+            return Ok(());
+        }
+    };
+    let ready = attachment.ready;
+    let attachment_lease = attachment.lease;
+    let session = attachment.session;
+    let mut ready_payload = BytesMut::new();
+    ready
+        .encode(&mut ready_payload)
+        .context("encode ConsumeReady")?;
+    write_frame_half(
+        &mut writer,
+        FrameType::ConsumeReady,
+        first.cid,
+        &ready_payload,
+    )
+    .await?;
+    let writer = Arc::new(Mutex::new(writer));
+    let stream_writer = writer.clone();
+    let mut writer_task = tokio::spawn(async move {
+        while let Some(frame) = outbound_rx.recv().await {
+            let mut output = stream_writer.lock().await;
+            write_frame_half(&mut output, frame.kind, frame.cid, &frame.payload).await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    let reader_result: anyhow::Result<()> = async {
+        loop {
+            tokio::select! {
+            incoming = read_wire_frame(&mut reader, &mut inbound_payload) => {
+                let Some(header) = incoming? else { break Ok(()); };
+                Metrics::inc(&metrics.ipc_frames_total);
+                let result = match header.kind {
+                    FrameType::ConsumeAck => decode_consumer(&inbound_payload, ConsumeAck::decode).and_then_async(|value| session.ack(value)).await,
+                    FrameType::ConsumeNack => decode_consumer(&inbound_payload, ConsumeNack::decode).and_then_async(|value| session.nack(value)).await,
+                    FrameType::FlowControl => decode_consumer(&inbound_payload, FlowControl::decode).and_then_async(|value| session.flow(value)).await,
+                    FrameType::ConsumeCommit => decode_consumer(&inbound_payload, ConsumeCommit::decode).and_then_async(|value| session.commit(value, header.cid)).await,
+                    FrameType::ConsumePause => decode_consumer(&inbound_payload, ConsumerPartitions::decode).and_then_async(|value| session.pause(value)).await,
+                    FrameType::ConsumePartitionResume => decode_consumer(&inbound_payload, ConsumerPartitions::decode).and_then_async(|value| session.resume_partitions(value)).await,
+                    FrameType::ConsumeClose => decode_consumer(&inbound_payload, ConsumeClose::decode).and_then_async(|value| session.close(value)).await,
+                    other => Err(ConsumerError::InvalidArgument(format!("invalid frame {other:?} on consumer stream"))),
+                };
+                if let Err(error) = result {
+                    let mut output = writer.lock().await;
+                    write_error_half(&mut output, header.cid, consumer_err_to_resp(&error)).await?;
+                    if matches!(error, ConsumerError::InvalidArgument(_) | ConsumerError::StaleEpoch { .. }) { break Ok(()); }
+                }
+                if header.kind == FrameType::ConsumeClose { break Ok(()); }
+            }
+            written = &mut writer_task => {
+                break match written {
+                    Ok(result) => result,
+                    Err(error) => Err(anyhow::anyhow!("consumer writer task failed: {error}")),
+                };
+            }
+            }
+        }
+    }
+    .await;
+    writer_task.abort();
+    session.disconnect(attachment_lease).await;
+    reader_result
+}
+
+trait ConsumerResultExt<T> {
+    async fn and_then_async<F, Fut>(self, operation: F) -> Result<(), ConsumerError>
+    where
+        F: FnOnce(T) -> Fut,
+        Fut: std::future::Future<Output = Result<(), ConsumerError>>;
+}
+
+impl<T> ConsumerResultExt<T> for Result<T, ConsumerError> {
+    async fn and_then_async<F, Fut>(self, operation: F) -> Result<(), ConsumerError>
+    where
+        F: FnOnce(T) -> Fut,
+        Fut: std::future::Future<Output = Result<(), ConsumerError>>,
+    {
+        operation(self?).await
+    }
+}
+
+fn decode_consumer<T>(
+    payload: &[u8],
+    decode: impl FnOnce(&[u8]) -> Result<T, hi_kafka_proto::PayloadError>,
+) -> Result<T, ConsumerError> {
+    decode(payload).map_err(|error| ConsumerError::InvalidArgument(error.to_string()))
+}
+
+async fn read_wire_frame(
+    reader: &mut tokio::net::unix::OwnedReadHalf,
+    payload: &mut BytesMut,
+) -> anyhow::Result<Option<hi_kafka_proto::Header>> {
+    let mut header_bytes = [0u8; HEADER_LEN];
+    match reader.read_exact(&mut header_bytes).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let header = codec::decode_header(&header_bytes).context("decode consumer frame header")?;
+    check_per_frame_limit(header.kind, header.payload_len)?;
+    payload.clear();
+    payload.resize(header.payload_len as usize, 0);
+    reader
+        .read_exact(payload)
+        .await
+        .context("read consumer frame payload")?;
+    Ok(Some(header))
+}
+
+async fn write_frame_half(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    kind: FrameType,
+    cid: u64,
+    payload: &[u8],
+) -> anyhow::Result<()> {
+    if payload.len() > MAX_PAYLOAD_LEN {
+        anyhow::bail!("consumer payload too large: {}", payload.len());
+    }
+    let mut header = [0u8; HEADER_LEN];
+    header[..4].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+    header[4] = kind as u8;
+    header[5..].copy_from_slice(&cid.to_be_bytes());
+    let slices = [IoSlice::new(&header), IoSlice::new(payload)];
+    let written = writer
+        .write_vectored(&slices)
+        .await
+        .context("write consumer frame")?;
+    if written == 0 {
+        return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into());
+    }
+    if written < HEADER_LEN {
+        writer
+            .write_all(&header[written..])
+            .await
+            .context("finish consumer header")?;
+        writer
+            .write_all(payload)
+            .await
+            .context("finish consumer payload")?;
+    } else if written < HEADER_LEN + payload.len() {
+        writer
+            .write_all(&payload[written - HEADER_LEN..])
+            .await
+            .context("finish consumer payload")?;
+    }
+    Ok(())
+}
+
+async fn write_error_half(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    cid: u64,
+    error: ErrorResp,
+) -> anyhow::Result<()> {
+    let mut payload = BytesMut::new();
+    error
+        .encode(&mut payload)
+        .context("encode consumer error")?;
+    write_frame_half(writer, FrameType::Error, cid, &payload).await
 }
 
 /// I: 外层 panic 兜底。每帧 dispatch 整体 catch_unwind，panic 时返回 Err
@@ -393,7 +622,7 @@ async fn dispatch_inner(
     cid: u64,
     payload: &[u8],
     producer: &ProducerHandle,
-    consumer: &ConsumerHandle,
+    _consumer: &ConsumerHandle,
     registry: &ClusterRegistryHandle,
     shutdown: &ShutdownHandle,
     metrics: &Arc<Metrics>,
@@ -401,9 +630,16 @@ async fn dispatch_inner(
 ) -> anyhow::Result<()> {
     match kind {
         FrameType::Hello => {
-            // 握手已经在 handle_connection 第一帧时处理完。如果握手后又收到
-            // HELLO，说明客户端实现有 bug——记 warn 但不强行关连接（兼容容错）。
-            warn!(cid, "spurious HELLO after handshake; ignoring");
+            write_error_frame(
+                stream,
+                cid,
+                ErrorResp::new(
+                    ErrorKind::Protocol,
+                    "HELLO is only valid as the first frame",
+                ),
+            )
+            .await?;
+            anyhow::bail!("repeated HELLO on established RPC connection");
         }
         FrameType::Ping => {
             debug!(cid, "PING received");
@@ -415,35 +651,8 @@ async fn dispatch_inner(
         FrameType::ProduceReq => {
             handle_produce_req(stream, cid, payload, producer, shutdown, metrics).await?;
         }
-        FrameType::SubscribeReq => {
-            handle_subscribe(stream, cid, payload, consumer).await?;
-        }
-        FrameType::PollReq => {
-            handle_poll(stream, cid, payload, consumer).await?;
-        }
-        FrameType::CommitReq => {
-            handle_commit(stream, cid, payload, consumer).await?;
-        }
-        FrameType::Unsubscribe => {
-            handle_unsubscribe(cid, payload, consumer).await;
-        }
         FrameType::RegisterClusterReq => {
             handle_register_cluster(stream, cid, payload, registry).await?;
-        }
-        FrameType::TxnReq => {
-            handle_txn(stream, cid, payload, producer).await?;
-        }
-        FrameType::PollRebalanceReq => {
-            handle_poll_rebalance(stream, cid, payload, consumer).await?;
-        }
-        FrameType::SeekReq => {
-            handle_seek(stream, cid, payload, consumer).await?;
-        }
-        FrameType::SendOffsetsReq => {
-            handle_send_offsets(stream, cid, payload, producer, consumer).await?;
-        }
-        FrameType::PauseResumeReq => {
-            handle_pause_resume(stream, cid, payload, consumer).await?;
         }
         FrameType::SetOAuthBearerTokenReq => {
             handle_set_oauth_token(stream, cid, payload, registry).await?;
@@ -457,205 +666,17 @@ async fn dispatch_inner(
             expedited.store(true, Ordering::Release);
         }
         other => {
-            warn!(kind = ?other, cid, "frame type not yet implemented");
+            warn!(kind = ?other, cid, "invalid frame on RPC connection");
+            write_error_frame(
+                stream,
+                cid,
+                ErrorResp::new(ErrorKind::Protocol, format!("invalid RPC frame {other:?}")),
+            )
+            .await?;
+            anyhow::bail!("invalid frame {other:?} on RPC connection");
         }
     }
     Ok(())
-}
-
-async fn handle_subscribe(
-    stream: &mut UnixStream,
-    cid: u64,
-    payload: &[u8],
-    consumer: &ConsumerHandle,
-) -> anyhow::Result<()> {
-    let req = match SubscribeReq::decode(payload) {
-        Ok(r) => r,
-        Err(e) => {
-            return write_error_frame(
-                stream,
-                cid,
-                ErrorResp::new(ErrorKind::Protocol, format!("payload decode: {e}")),
-            )
-            .await;
-        }
-    };
-    match consumer.subscribe(req).await {
-        Ok(sub) => {
-            let mut buf = BytesMut::new();
-            SubscribeResp::Ok {
-                subscription_id: sub.0,
-            }
-            .encode(&mut buf)
-            .context("encode subscribe_resp")?;
-            write_frame(stream, FrameType::SubscribeResp, cid, &buf).await
-        }
-        Err(e) => write_error_frame(stream, cid, consumer_err_to_resp(&e)).await,
-    }
-}
-
-async fn handle_poll(
-    stream: &mut UnixStream,
-    cid: u64,
-    payload: &[u8],
-    consumer: &ConsumerHandle,
-) -> anyhow::Result<()> {
-    let req = match PollReq::decode(payload) {
-        Ok(r) => r,
-        Err(e) => {
-            return write_error_frame(
-                stream,
-                cid,
-                ErrorResp::new(ErrorKind::Protocol, format!("payload decode: {e}")),
-            )
-            .await;
-        }
-    };
-    let sub = SubscriptionId(req.subscription_id);
-    match consumer.poll(sub, req.max_messages, req.timeout_ms).await {
-        Ok(messages) => {
-            let mut buf = BytesMut::new();
-            PollResp::Ok { messages }
-                .encode(&mut buf)
-                .context("encode poll_resp")?;
-            write_frame(stream, FrameType::PollResp, cid, &buf).await
-        }
-        Err(e) => write_error_frame(stream, cid, consumer_err_to_resp(&e)).await,
-    }
-}
-
-async fn handle_commit(
-    stream: &mut UnixStream,
-    cid: u64,
-    payload: &[u8],
-    consumer: &ConsumerHandle,
-) -> anyhow::Result<()> {
-    let req = match CommitReq::decode(payload) {
-        Ok(r) => r,
-        Err(e) => {
-            return write_error_frame(
-                stream,
-                cid,
-                ErrorResp::new(ErrorKind::Protocol, format!("payload decode: {e}")),
-            )
-            .await;
-        }
-    };
-    let sub = SubscriptionId(req.subscription_id);
-    match consumer.commit(sub).await {
-        Ok(()) => {
-            let mut buf = BytesMut::new();
-            CommitResp::Ok.encode(&mut buf).context("encode commit_resp")?;
-            write_frame(stream, FrameType::CommitResp, cid, &buf).await
-        }
-        Err(e) => write_error_frame(stream, cid, consumer_err_to_resp(&e)).await,
-    }
-}
-
-async fn handle_seek(
-    stream: &mut UnixStream,
-    cid: u64,
-    payload: &[u8],
-    consumer: &ConsumerHandle,
-) -> anyhow::Result<()> {
-    let req = match SeekReq::decode(payload) {
-        Ok(r) => r,
-        Err(e) => {
-            return write_error_frame(
-                stream,
-                cid,
-                ErrorResp::new(ErrorKind::Protocol, format!("payload decode: {e}")),
-            )
-            .await;
-        }
-    };
-    let sub = SubscriptionId(req.subscription_id());
-    let r = match req {
-        SeekReq::ByOffset { targets, .. } => consumer.seek_by_offset(sub, targets).await,
-        SeekReq::ByTimestamp {
-            timestamp_ms,
-            partitions,
-            ..
-        } => {
-            consumer
-                .seek_by_timestamp(sub, timestamp_ms, partitions)
-                .await
-        }
-    };
-    match r {
-        Ok(()) => {
-            let mut buf = BytesMut::new();
-            SeekResp::Ok.encode(&mut buf).context("encode seek_resp")?;
-            write_frame(stream, FrameType::SeekResp, cid, &buf).await
-        }
-        Err(e) => write_error_frame(stream, cid, consumer_err_to_resp(&e)).await,
-    }
-}
-
-async fn handle_poll_rebalance(
-    stream: &mut UnixStream,
-    cid: u64,
-    payload: &[u8],
-    consumer: &ConsumerHandle,
-) -> anyhow::Result<()> {
-    let req = match PollRebalanceReq::decode(payload) {
-        Ok(r) => r,
-        Err(e) => {
-            return write_error_frame(
-                stream,
-                cid,
-                ErrorResp::new(ErrorKind::Protocol, format!("payload decode: {e}")),
-            )
-            .await;
-        }
-    };
-    let sub = SubscriptionId(req.subscription_id);
-    match consumer.fetch_rebalance_events(sub, req.max_events).await {
-        Ok(events) => {
-            let mut buf = BytesMut::new();
-            PollRebalanceResp::Ok { events }
-                .encode(&mut buf)
-                .context("encode poll_rebalance_resp")?;
-            write_frame(stream, FrameType::PollRebalanceResp, cid, &buf).await
-        }
-        Err(e) => write_error_frame(stream, cid, consumer_err_to_resp(&e)).await,
-    }
-}
-
-async fn handle_txn(
-    stream: &mut UnixStream,
-    cid: u64,
-    payload: &[u8],
-    producer: &ProducerHandle,
-) -> anyhow::Result<()> {
-    let req = match TxnReq::decode(payload) {
-        Ok(r) => r,
-        Err(e) => {
-            return write_error_frame(
-                stream,
-                cid,
-                ErrorResp::new(ErrorKind::Protocol, format!("payload decode: {e}")),
-            )
-            .await;
-        }
-    };
-    let r = match req.op {
-        TxnOp::Begin => producer.begin_transaction(&req.cluster).await,
-        TxnOp::Commit => producer.commit_transaction(&req.cluster).await,
-        TxnOp::Abort => producer.abort_transaction(&req.cluster).await,
-    };
-    match r {
-        Ok(()) => {
-            info!(cluster = %req.cluster, op = ?req.op, "txn op ok");
-            let mut buf = BytesMut::new();
-            TxnResp::Ok.encode(&mut buf).context("encode txn_resp")?;
-            write_frame(stream, FrameType::TxnResp, cid, &buf).await
-        }
-        Err(e) => {
-            warn!(cluster = %req.cluster, op = ?req.op, error = ?e, "txn op failed");
-            write_error_frame(stream, cid, WorkerError::from_anyhow(&e)).await
-        }
-    }
 }
 
 async fn handle_set_oauth_token(
@@ -695,102 +716,12 @@ async fn handle_set_oauth_token(
         Err(msg) => {
             warn!(%cluster, error = %msg, "set_oauth_token failed");
             // set_oauth_token 失败基本是目标 cluster 尚未注册
-            write_error_frame(stream, cid, ErrorResp::new(ErrorKind::ClusterNotRegistered, msg))
-                .await
-        }
-    }
-}
-
-async fn handle_pause_resume(
-    stream: &mut UnixStream,
-    cid: u64,
-    payload: &[u8],
-    consumer: &ConsumerHandle,
-) -> anyhow::Result<()> {
-    let req = match PauseResumeReq::decode(payload) {
-        Ok(r) => r,
-        Err(e) => {
-            return write_error_frame(
+            write_error_frame(
                 stream,
                 cid,
-                ErrorResp::new(ErrorKind::Protocol, format!("payload decode: {e}")),
+                ErrorResp::new(ErrorKind::ClusterNotRegistered, msg),
             )
-            .await;
-        }
-    };
-    let sub = SubscriptionId(req.subscription_id);
-    let count = req.partitions.len();
-    let r = match req.op {
-        PauseResumeOp::Pause => consumer.pause(sub, req.partitions).await,
-        PauseResumeOp::Resume => consumer.resume(sub, req.partitions).await,
-    };
-    match r {
-        Ok(()) => {
-            debug!(?sub, op = ?req.op, count, "pause/resume ok");
-            let mut buf = BytesMut::new();
-            PauseResumeResp::Ok
-                .encode(&mut buf)
-                .context("encode pause_resume_resp")?;
-            write_frame(stream, FrameType::PauseResumeResp, cid, &buf).await
-        }
-        Err(e) => {
-            warn!(?sub, op = ?req.op, error = ?e, "pause/resume failed");
-            write_error_frame(stream, cid, consumer_err_to_resp(&e)).await
-        }
-    }
-}
-
-async fn handle_send_offsets(
-    stream: &mut UnixStream,
-    cid: u64,
-    payload: &[u8],
-    producer: &ProducerHandle,
-    consumer: &ConsumerHandle,
-) -> anyhow::Result<()> {
-    let req = match SendOffsetsReq::decode(payload) {
-        Ok(r) => r,
-        Err(e) => {
-            return write_error_frame(
-                stream,
-                cid,
-                ErrorResp::new(ErrorKind::Protocol, format!("payload decode: {e}")),
-            )
-            .await;
-        }
-    };
-    let sub = SubscriptionId(req.subscription_id);
-    // 1) 拿 group_metadata（subscription 不存在 → SUBSCRIPTION_NOT_FOUND，触发自愈）
-    let metadata = match consumer.group_metadata(sub).await {
-        Ok(m) => m,
-        Err(e) => return write_error_frame(stream, cid, consumer_err_to_resp(&e)).await,
-    };
-    // 2) 调 producer 把 offsets 提交进当前事务
-    match producer
-        .send_offsets_to_transaction(&req.producer_cluster, &req.group_id, req.offsets, metadata)
-        .await
-    {
-        Ok(()) => {
-            info!(
-                cluster = %req.producer_cluster,
-                group_id = %req.group_id,
-                ?sub,
-                "send_offsets_to_transaction ok"
-            );
-            let mut buf = BytesMut::new();
-            SendOffsetsResp::Ok
-                .encode(&mut buf)
-                .context("encode send_offsets_resp")?;
-            write_frame(stream, FrameType::SendOffsetsResp, cid, &buf).await
-        }
-        Err(e) => {
-            warn!(
-                cluster = %req.producer_cluster,
-                group_id = %req.group_id,
-                ?sub,
-                error = ?e,
-                "send_offsets_to_transaction failed"
-            );
-            write_error_frame(stream, cid, WorkerError::from_anyhow(&e)).await
+            .await
         }
     }
 }
@@ -834,20 +765,6 @@ async fn handle_register_cluster(
     write_frame(stream, FrameType::RegisterClusterResp, cid, &buf).await
 }
 
-async fn handle_unsubscribe(cid: u64, payload: &[u8], consumer: &ConsumerHandle) {
-    match UnsubscribeReq::decode(payload) {
-        Ok(req) => {
-            let sub = SubscriptionId(req.subscription_id);
-            if let Err(e) = consumer.unsubscribe(sub).await {
-                warn!(cid, ?sub, error = ?e, "unsubscribe failed");
-            }
-        }
-        Err(e) => {
-            warn!(cid, error = ?e, "unsubscribe payload decode failed");
-        }
-    }
-}
-
 /// P2 #9：panic guard 包裹 produce_ack + encode + write_frame。
 ///
 /// 真实风险：produce_ack 已 ack broker（消息已 commit）后，在 encode/write 之间
@@ -879,6 +796,7 @@ async fn handle_produce_req(
             let err_resp = ErrorResp {
                 kind: ErrorKind::Internal,
                 retryable: true,
+                outcome: hi_kafka_proto::OperationOutcome::Unknown,
                 native_code: 0,
                 message: format!("server panic: {msg}"),
             };
@@ -1005,13 +923,8 @@ async fn handle_produce_req_inner(
     }
 }
 
-/// worker 侧兜底：v1 legacy 帧走 `DEFAULT_PRODUCE_TIMEOUT_MS`（正数），v2 帧
-/// 走扩展侧 `require_positive_u32` 校验（也是正数）——正常路径 `timeout_ms` 一定 ≥ 1。
-///
-/// 这里的 `.max(1)` 是**深度防御**：万一未来协议改动漏了校验、或第三方客户端
-/// 直接构造裸帧，避免 0 ms 传给 `tokio::time::timeout` 造成"立即触发 Timeout"
-/// 的迷惑行为。业务侧看到的 KafkaException.kind_name = "TIMEOUT"，但 message
-/// 是 "produceSync timed out after 1 ms"——比 "0 ms" 更好识别是防御路径。
+/// Defense in depth for raw protocol clients: a zero timeout still gets a
+/// deterministic 1 ms operation instead of an immediate scheduler timeout.
 fn req_timeout_ms(timeout_ms: u32) -> u64 {
     timeout_ms.max(1) as u64
 }
@@ -1044,13 +957,5 @@ async fn write_error_frame(
 /// 把 [`ConsumerError`] 映射成结构化 [`ErrorResp`]。
 /// 关键：`NotFound → SUBSCRIPTION_NOT_FOUND`，让扩展端自愈从字符串匹配升级为 kind 判定。
 fn consumer_err_to_resp(e: &ConsumerError) -> ErrorResp {
-    match e {
-        ConsumerError::NotFound(_) => {
-            ErrorResp::new(ErrorKind::SubscriptionNotFound, e.to_string())
-        }
-        ConsumerError::UnknownCluster(_) => {
-            ErrorResp::new(ErrorKind::ClusterNotRegistered, e.to_string())
-        }
-        ConsumerError::Backend(err) => WorkerError::from_anyhow(err),
-    }
+    e.response()
 }

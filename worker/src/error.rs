@@ -6,12 +6,13 @@
 //! [`FrameType::Error`](hi_kafka_proto::FrameType::Error) 帧回 PHP——
 //! 让业务侧拿到机器可读分类，而非 `str_contains(message)` 猜。
 
-use hi_kafka_proto::{ErrorKind, ErrorResp};
+use hi_kafka_proto::{ErrorKind, ErrorResp, OperationOutcome};
 
 #[derive(Debug, Clone)]
 pub struct WorkerError {
     pub kind: ErrorKind,
     pub retryable: bool,
+    pub outcome: OperationOutcome,
     /// 原生 librdkafka `rd_kafka_resp_err_t`；无则 0。
     pub native_code: i32,
     pub message: String,
@@ -23,6 +24,7 @@ impl WorkerError {
         Self {
             kind,
             retryable: kind.default_retryable(),
+            outcome: OperationOutcome::NotApplied,
             native_code: 0,
             message: message.into(),
         }
@@ -32,6 +34,7 @@ impl WorkerError {
         ErrorResp {
             kind: self.kind,
             retryable: self.retryable,
+            outcome: self.outcome,
             native_code: self.native_code,
             message: self.message.clone(),
         }
@@ -91,6 +94,7 @@ mod tests {
         let we = WorkerError {
             kind: ErrorKind::BrokerRetryable,
             retryable: true,
+            outcome: OperationOutcome::NotApplied,
             native_code: -184,
             message: "queue full".into(),
         };
