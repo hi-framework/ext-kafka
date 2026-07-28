@@ -7,7 +7,9 @@
 //! 3. **idle 自退**：无 Goodbye、连接全断、持续空闲超过 idle_timeout → 自退。
 
 use bytes::BytesMut;
-use hi_kafka_proto::{encode_frame, FrameType, HelloReq, HEADER_LEN, PROTOCOL_MAJOR};
+use hi_kafka_proto::{
+    encode_frame, ConnectionRole, FrameType, HelloReq, CAP_ALL, HEADER_LEN, PROTOCOL_MAJOR,
+};
 use hi_kafka_worker::{cluster::ClusterRegistry, shutdown::ShutdownState, Metrics, Server};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,7 +37,7 @@ async fn start_worker(idle_timeout: Duration) -> (PathBuf, std::sync::Arc<Shutdo
     let server = Server::bind_with(
         &socket,
         hi_kafka_worker::producer::logging(),
-        hi_kafka_worker::consumer::logging(),
+        hi_kafka_worker::consumer::logging(shutdown.clone(), Metrics::new()),
         ClusterRegistry::new(),
         shutdown,
         Metrics::new(),
@@ -59,6 +61,8 @@ async fn connect_handshake(socket: &PathBuf) -> UnixStream {
     let mut payload = BytesMut::new();
     HelloReq {
         major: PROTOCOL_MAJOR,
+        role: ConnectionRole::Rpc,
+        capabilities: CAP_ALL,
     }
     .encode(&mut payload)
     .unwrap();
@@ -66,7 +70,7 @@ async fn connect_handshake(socket: &PathBuf) -> UnixStream {
     encode_frame(FrameType::Hello, 0, &payload, &mut frame).unwrap();
     client.write_all(&frame).await.unwrap();
     client.flush().await.unwrap();
-    let mut resp = vec![0u8; HEADER_LEN + 1];
+    let mut resp = vec![0u8; HEADER_LEN + 9];
     client.read_exact(&mut resp).await.unwrap();
     assert_eq!(resp[4], FrameType::Hello as u8);
     client

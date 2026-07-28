@@ -2,7 +2,10 @@
 //! 验证 server 能正确解码并 dispatch。
 
 use bytes::BytesMut;
-use hi_kafka_proto::{encode_frame, FrameType, HelloReq, ProduceFnf, HEADER_LEN, PROTOCOL_MAJOR};
+use hi_kafka_proto::{
+    encode_frame, ConnectionRole, FrameType, HelloReq, ProduceFnf, CAP_ALL, HEADER_LEN,
+    PROTOCOL_MAJOR,
+};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -14,6 +17,8 @@ async fn handshake(client: &mut UnixStream) {
     let mut payload = BytesMut::new();
     HelloReq {
         major: PROTOCOL_MAJOR,
+        role: ConnectionRole::Rpc,
+        capabilities: CAP_ALL,
     }
     .encode(&mut payload)
     .unwrap();
@@ -21,8 +26,8 @@ async fn handshake(client: &mut UnixStream) {
     encode_frame(FrameType::Hello, 0, &payload, &mut frame).unwrap();
     client.write_all(&frame).await.unwrap();
     client.flush().await.unwrap();
-    // RESP 固定 HEADER_LEN + 1B major
-    let mut resp = vec![0u8; HEADER_LEN + 1];
+    // RESP: major + capability bitset.
+    let mut resp = vec![0u8; HEADER_LEN + 9];
     client.read_exact(&mut resp).await.unwrap();
     assert_eq!(resp[4], FrameType::Hello as u8);
     assert_eq!(resp[HEADER_LEN], PROTOCOL_MAJOR);
@@ -79,8 +84,7 @@ async fn test_produce_fnf_end_to_end() {
     client.flush().await.unwrap();
     drop(client);
 
-    // 给 server dispatch 一点时间。MVP 期没有 ack 路径可以直接 await，
-    // 实测这一步在 protocol v2 引入 ack 后会改为 wait_for_resp。
+    // FNF 无响应，给 server dispatch 一点时间。
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // 清理
