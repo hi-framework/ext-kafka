@@ -2,7 +2,7 @@
 //!
 //! L：worker 进程死亡 → spawn 新 worker 后，新 worker 的 ClusterRegistry 是空的。
 //! 业务侧只在启动时调一次 `registerCluster` / `setOAuthBearerToken`，后续 produce /
-//! subscribe / commit 都靠那次注册。所以扩展端必须把 PHP 这一侧已经成功过的所有
+//! Consumer stream 与后续 produce 都依赖那次注册。所以扩展端必须把 PHP 这一侧已经成功过的所有
 //! cluster 注册（含 OAuth token）记下来，在新 worker spawn 后透明重放，让"worker
 //! 死亡 → 所有 RPC 自愈"链路完整闭环。
 //!

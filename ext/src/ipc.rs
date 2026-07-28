@@ -10,13 +10,9 @@ use crate::spawn;
 use crate::worker_health::{self, EnsureOutcome};
 use bytes::BytesMut;
 use hi_kafka_proto::{
-    codec, encode_frame, CommitReq, CommitResp, ConsumerMessage, ErrorKind, ErrorResp, FrameType,
-    OffsetCommit,
-    OffsetSpec, PartitionSpec, PauseResumeOp, PauseResumeReq, PauseResumeResp, PollRebalanceReq,
-    PollRebalanceResp, PollReq, PollResp, ProduceFnf, ProduceReq, ProduceResp, RebalanceEvent,
-    RegisterClusterReq, RegisterClusterResp, SeekReq, SeekResp, SendOffsetsReq, SendOffsetsResp,
-    SetOAuthBearerTokenReq, SetOAuthBearerTokenResp, SubscribeReq, SubscribeResp, TxnOp, TxnReq,
-    TxnResp, UnsubscribeReq, HEADER_LEN,
+    codec, encode_frame, ErrorKind, ErrorResp, FrameType, OperationOutcome, ProduceFnf, ProduceReq,
+    ProduceResp, RegisterClusterReq, RegisterClusterResp, SetOAuthBearerTokenReq,
+    SetOAuthBearerTokenResp, HEADER_LEN,
 };
 use std::io::{Read, Write};
 use std::path::Path;
@@ -81,6 +77,7 @@ pub enum IpcError {
     Worker {
         kind: ErrorKind,
         retryable: bool,
+        outcome: OperationOutcome,
         native_code: i32,
         message: String,
     },
@@ -157,7 +154,7 @@ fn should_invalidate(e: &IpcError) -> bool {
         ),
         IpcError::Encode(_) | IpcError::DecodeResp(_) => false,
         IpcError::UnexpectedKind(_) | IpcError::CidMismatch { .. } => false,
-        IpcError::Server(_) => false, // 业务层错误，worker 还活着
+        IpcError::Server(_) => false,     // 业务层错误，worker 还活着
         IpcError::Worker { .. } => false, // worker 回的结构化业务错误，worker 还活着
     }
 }
@@ -315,7 +312,13 @@ fn produce_fnf_inner(
     let pool = pool::pool_for(Path::new(socket));
     let mut conn = pool.acquire()?;
     let timeout = Duration::from_secs(5);
-    write_frame(&mut conn, FrameType::ProduceFnf, cid, &payload, Some(timeout))?;
+    write_frame(
+        &mut conn,
+        FrameType::ProduceFnf,
+        cid,
+        &payload,
+        Some(timeout),
+    )?;
     // FNF 分层：等 worker 本地 enqueue ack（不等 broker delivery）。同步可知的前置错误
     // （cluster 未注册 / 队列满 / 参数非法）会以 Error 帧经 recv_resp 变成 IpcError::Worker。
     let (kind, _payload) = recv_resp(&mut conn, cid, timeout)?;
@@ -368,7 +371,13 @@ fn produce_fnf_bin_inner(
     let pool = pool::pool_for(Path::new(socket));
     let mut conn = pool.acquire()?;
     let timeout = Duration::from_secs(5);
-    write_frame(&mut conn, FrameType::ProduceFnf, cid, &payload, Some(timeout))?;
+    write_frame(
+        &mut conn,
+        FrameType::ProduceFnf,
+        cid,
+        &payload,
+        Some(timeout),
+    )?;
     let (kind, _payload) = recv_resp(&mut conn, cid, timeout)?;
     if kind != FrameType::ProduceResp {
         conn.poison();
@@ -433,7 +442,14 @@ fn produce_sync_inner(
     timeout: Duration,
 ) -> Result<ProduceResp, IpcError> {
     ensure(socket)?;
-    let payload = encode_produce_req_payload_bin(cluster, topic, key.as_bytes(), value.as_bytes(), opts, timeout)?;
+    let payload = encode_produce_req_payload_bin(
+        cluster,
+        topic,
+        key.as_bytes(),
+        value.as_bytes(),
+        opts,
+        timeout,
+    )?;
     let cid = next_cid();
     let pool = pool::pool_for(Path::new(socket));
     let mut conn = pool.acquire()?;
@@ -456,26 +472,8 @@ fn produce_sync_inner(
 }
 
 // ============================================================================
-// Consumer 操作（subscribe / poll / commit / unsubscribe）
+// Shared control-plane response reader
 // ============================================================================
-
-/// 通用 req/resp 流程：写一帧、读 13B header（按 cid 校验）、读 payload，返回 payload bytes。
-///
-/// K: 自动 with_retry 包装——所有走 round_trip 的 RPC（subscribe / poll / commit /
-/// register_cluster / seek / pause_resume / txn / send_offsets / oauth / poll_rebalance）
-/// 在 worker 失联时自动重试一次。第二次仍失败才返回错误。重试只针对 "worker 死"
-/// 类错误（see `should_invalidate`）；业务错误（CidMismatch / Server）一次返回。
-fn round_trip(
-    socket: &str,
-    req_kind: FrameType,
-    expected_resp_kind: FrameType,
-    req_payload: &[u8],
-    timeout: Duration,
-) -> Result<Vec<u8>, IpcError> {
-    with_retry(socket, || {
-        round_trip_once(socket, req_kind, expected_resp_kind, req_payload, timeout)
-    })
-}
 
 /// round_trip 的单次执行体。retry-friendly：失败不副作用，全部清理由 PooledConn::Drop 处理。
 /// 读一帧响应：13B header（校验 cid）+ payload。
@@ -519,6 +517,7 @@ fn recv_resp(
         return Err(IpcError::Worker {
             kind: er.kind,
             retryable: er.retryable,
+            outcome: er.outcome,
             native_code: er.native_code,
             message: er.message,
         });
@@ -546,84 +545,6 @@ fn round_trip_once(
         return Err(IpcError::UnexpectedKind(kind));
     }
     Ok(payload)
-}
-
-pub fn subscribe(
-    socket: &str,
-    cluster: &str,
-    group_id: &str,
-    topics: Vec<String>,
-    config: Vec<(String, String)>,
-    timeout: Duration,
-) -> Result<u64, IpcError> {
-    let req = SubscribeReq {
-        cluster: cluster.to_string(),
-        group_id: group_id.to_string(),
-        topics,
-        config,
-    };
-    let mut payload = BytesMut::new();
-    req.encode(&mut payload)
-        .map_err(|e| IpcError::Encode(e.to_string()))?;
-
-    let resp_bytes = round_trip(
-        socket,
-        FrameType::SubscribeReq,
-        FrameType::SubscribeResp,
-        &payload,
-        timeout,
-    )?;
-    match SubscribeResp::decode(&resp_bytes).map_err(|e| IpcError::DecodeResp(e.to_string()))? {
-        SubscribeResp::Ok { subscription_id } => Ok(subscription_id),
-        SubscribeResp::Err { message } => Err(IpcError::Server(message)),
-    }
-}
-
-pub fn poll(
-    socket: &str,
-    subscription_id: u64,
-    max_messages: u32,
-    timeout_ms: u32,
-) -> Result<Vec<ConsumerMessage>, IpcError> {
-    let req = PollReq {
-        subscription_id,
-        max_messages,
-        timeout_ms,
-    };
-    let mut payload = BytesMut::new();
-    req.encode(&mut payload)
-        .map_err(|e| IpcError::Encode(e.to_string()))?;
-    // IPC 超时 = poll timeout + 安全裕度
-    let io_timeout = Duration::from_millis(timeout_ms as u64) + Duration::from_secs(2);
-    let resp_bytes = round_trip(
-        socket,
-        FrameType::PollReq,
-        FrameType::PollResp,
-        &payload,
-        io_timeout,
-    )?;
-    match PollResp::decode(&resp_bytes).map_err(|e| IpcError::DecodeResp(e.to_string()))? {
-        PollResp::Ok { messages } => Ok(messages),
-        PollResp::Err { message } => Err(IpcError::Server(message)),
-    }
-}
-
-pub fn commit(socket: &str, subscription_id: u64, timeout: Duration) -> Result<(), IpcError> {
-    let req = CommitReq { subscription_id };
-    let mut payload = BytesMut::new();
-    req.encode(&mut payload)
-        .map_err(|e| IpcError::Encode(e.to_string()))?;
-    let resp_bytes = round_trip(
-        socket,
-        FrameType::CommitReq,
-        FrameType::CommitResp,
-        &payload,
-        timeout,
-    )?;
-    match CommitResp::decode(&resp_bytes).map_err(|e| IpcError::DecodeResp(e.to_string()))? {
-        CommitResp::Ok => Ok(()),
-        CommitResp::Err { message } => Err(IpcError::Server(message)),
-    }
 }
 
 pub fn register_cluster(
@@ -669,77 +590,6 @@ fn register_cluster_once(
     {
         RegisterClusterResp::Ok => Ok(()),
         RegisterClusterResp::Err { message } => Err(IpcError::Server(message)),
-    }
-}
-
-pub fn seek_by_offset(
-    socket: &str,
-    subscription_id: u64,
-    targets: Vec<OffsetSpec>,
-    timeout: Duration,
-) -> Result<(), IpcError> {
-    let req = SeekReq::ByOffset {
-        subscription_id,
-        targets,
-    };
-    seek_round_trip(socket, req, timeout)
-}
-
-pub fn seek_by_timestamp(
-    socket: &str,
-    subscription_id: u64,
-    timestamp_ms: i64,
-    partitions: Vec<PartitionSpec>,
-    timeout: Duration,
-) -> Result<(), IpcError> {
-    let req = SeekReq::ByTimestamp {
-        subscription_id,
-        timestamp_ms,
-        partitions,
-    };
-    seek_round_trip(socket, req, timeout)
-}
-
-fn seek_round_trip(socket: &str, req: SeekReq, timeout: Duration) -> Result<(), IpcError> {
-    let mut payload = BytesMut::new();
-    req.encode(&mut payload)
-        .map_err(|e| IpcError::Encode(e.to_string()))?;
-    let resp_bytes = round_trip(
-        socket,
-        FrameType::SeekReq,
-        FrameType::SeekResp,
-        &payload,
-        timeout,
-    )?;
-    match SeekResp::decode(&resp_bytes).map_err(|e| IpcError::DecodeResp(e.to_string()))? {
-        SeekResp::Ok => Ok(()),
-        SeekResp::Err { message } => Err(IpcError::Server(message)),
-    }
-}
-
-pub fn poll_rebalance(
-    socket: &str,
-    subscription_id: u64,
-    max_events: u32,
-    timeout: Duration,
-) -> Result<Vec<RebalanceEvent>, IpcError> {
-    let req = PollRebalanceReq {
-        subscription_id,
-        max_events,
-    };
-    let mut payload = BytesMut::new();
-    req.encode(&mut payload)
-        .map_err(|e| IpcError::Encode(e.to_string()))?;
-    let resp_bytes = round_trip(
-        socket,
-        FrameType::PollRebalanceReq,
-        FrameType::PollRebalanceResp,
-        &payload,
-        timeout,
-    )?;
-    match PollRebalanceResp::decode(&resp_bytes).map_err(|e| IpcError::DecodeResp(e.to_string()))? {
-        PollRebalanceResp::Ok { events } => Ok(events),
-        PollRebalanceResp::Err { message } => Err(IpcError::Server(message)),
     }
 }
 
@@ -810,108 +660,6 @@ fn set_oauth_bearer_token_once(
     }
 }
 
-pub fn pause_resume(
-    socket: &str,
-    subscription_id: u64,
-    op: PauseResumeOp,
-    partitions: Vec<(String, i32)>,
-    timeout: Duration,
-) -> Result<(), IpcError> {
-    let req = PauseResumeReq {
-        subscription_id,
-        op,
-        partitions,
-    };
-    let mut payload = BytesMut::new();
-    req.encode(&mut payload)
-        .map_err(|e| IpcError::Encode(e.to_string()))?;
-    let resp_bytes = round_trip(
-        socket,
-        FrameType::PauseResumeReq,
-        FrameType::PauseResumeResp,
-        &payload,
-        timeout,
-    )?;
-    match PauseResumeResp::decode(&resp_bytes).map_err(|e| IpcError::DecodeResp(e.to_string()))? {
-        PauseResumeResp::Ok => Ok(()),
-        PauseResumeResp::Err { message } => Err(IpcError::Server(message)),
-    }
-}
-
-pub fn send_offsets_to_transaction(
-    socket: &str,
-    producer_cluster: &str,
-    subscription_id: u64,
-    group_id: &str,
-    offsets: Vec<OffsetCommit>,
-    timeout: Duration,
-) -> Result<(), IpcError> {
-    let req = SendOffsetsReq {
-        producer_cluster: producer_cluster.to_string(),
-        subscription_id,
-        group_id: group_id.to_string(),
-        offsets,
-    };
-    let mut payload = BytesMut::new();
-    req.encode(&mut payload)
-        .map_err(|e| IpcError::Encode(e.to_string()))?;
-    let resp_bytes = round_trip(
-        socket,
-        FrameType::SendOffsetsReq,
-        FrameType::SendOffsetsResp,
-        &payload,
-        timeout,
-    )?;
-    match SendOffsetsResp::decode(&resp_bytes).map_err(|e| IpcError::DecodeResp(e.to_string()))? {
-        SendOffsetsResp::Ok => Ok(()),
-        SendOffsetsResp::Err { message } => Err(IpcError::Server(message)),
-    }
-}
-
-pub fn txn(socket: &str, cluster: &str, op: TxnOp, timeout: Duration) -> Result<(), IpcError> {
-    let req = TxnReq {
-        cluster: cluster.to_string(),
-        op,
-    };
-    let mut payload = BytesMut::new();
-    req.encode(&mut payload)
-        .map_err(|e| IpcError::Encode(e.to_string()))?;
-    let resp_bytes = round_trip(
-        socket,
-        FrameType::TxnReq,
-        FrameType::TxnResp,
-        &payload,
-        timeout,
-    )?;
-    match TxnResp::decode(&resp_bytes).map_err(|e| IpcError::DecodeResp(e.to_string()))? {
-        TxnResp::Ok => Ok(()),
-        TxnResp::Err { message } => Err(IpcError::Server(message)),
-    }
-}
-
-pub fn unsubscribe(socket: &str, subscription_id: u64) -> Result<(), IpcError> {
-    // K: 与 round_trip 对称——unsubscribe 是 fire-and-forget 但仍走 with_retry，
-    // 这样 worker 重启后第一次发被关连接也能透明恢复
-    with_retry(socket, || unsubscribe_once(socket, subscription_id))
-}
-
-fn unsubscribe_once(socket: &str, subscription_id: u64) -> Result<(), IpcError> {
-    ensure(socket)?;
-    let req = UnsubscribeReq { subscription_id };
-    let mut payload = BytesMut::new();
-    req.encode(&mut payload)
-        .map_err(|e| IpcError::Encode(e.to_string()))?;
-    let pool = pool::pool_for(Path::new(socket));
-    let mut conn = pool.acquire()?;
-    write_frame(
-        &mut conn,
-        FrameType::Unsubscribe,
-        0,
-        &payload,
-        Some(Duration::from_secs(1)),
-    )
-}
-
 // ============================================================================
 // 单元测试
 // ============================================================================
@@ -930,12 +678,14 @@ mod tests {
     #[test]
     fn test_should_invalidate_io_kinds_true() {
         use std::io::ErrorKind::*;
-        for k in [BrokenPipe, ConnectionReset, ConnectionRefused, ConnectionAborted, UnexpectedEof]
-        {
-            assert!(
-                should_invalidate(&io(k)),
-                "{k:?} 应触发缓存失效"
-            );
+        for k in [
+            BrokenPipe,
+            ConnectionReset,
+            ConnectionRefused,
+            ConnectionAborted,
+            UnexpectedEof,
+        ] {
+            assert!(should_invalidate(&io(k)), "{k:?} 应触发缓存失效");
         }
     }
 
@@ -956,6 +706,7 @@ mod tests {
         let e = IpcError::Worker {
             kind: ErrorKind::InvalidArgument,
             retryable: false,
+            outcome: OperationOutcome::NotApplied,
             native_code: -1,
             message: "bad arg".into(),
         };
@@ -970,7 +721,10 @@ mod tests {
         assert!(!should_invalidate(&IpcError::UnexpectedKind(
             FrameType::Ping
         )));
-        assert!(!should_invalidate(&IpcError::CidMismatch { sent: 1, got: 2 }));
+        assert!(!should_invalidate(&IpcError::CidMismatch {
+            sent: 1,
+            got: 2
+        }));
         assert!(!should_invalidate(&IpcError::Server("srv err".into())));
     }
 
@@ -1114,8 +868,8 @@ mod tests {
         let value = b"v\x00al\xff";
         let payload = encode_produce_payload_bin("c", "t", key, value, &opts).unwrap();
         // payload 内应能找到原始字节序列
-        assert!(payload.iter().any(|&b| b == 0x00), "null 字节被保留");
-        assert!(payload.iter().any(|&b| b == 0xff), "0xff 字节被保留");
+        assert!(payload.contains(&0x00), "null 字节被保留");
+        assert!(payload.contains(&0xff), "0xff 字节被保留");
     }
 
     #[test]

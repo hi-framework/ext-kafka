@@ -8,7 +8,7 @@
 //!   [`PooledConn::poison`]，连接会被直接丢弃（用于 IO 出错的连接）。
 //! - **半关闭检测**：acquire 时对取出的连接做 `set_nonblocking + peek`
 //!   探测，若发现 EOF 或 RST，丢弃并新建。代价 ≤ 1 syscall。
-//! - **MVP 阻塞 IO**：协程感知留给 Phase 3。这里默认 PHP-FPM / CLI 场景，
+//! - **阻塞 IO**：这里服务 PHP-FPM / CLI；Swoole/Swow 使用各自的 coroutine driver，
 //!   在 Swoole/Swow 下也能用——因为单次 produce 的 IO 时间通常 < 5ms，
 //!   不会显著影响协程调度。
 //!
@@ -297,7 +297,7 @@ mod tests {
         p
     }
 
-    /// fake worker：HELLO 帧固定 14B（13B header + 1B payload），裸字节
+    /// fake worker：读取 v2 HELLO（13B header + 10B payload）并返回能力集。
     /// 读+写完就挂。比走 codec/encode_frame 更直接。
     fn spawn_echo_server(socket: &Path) -> thread::JoinHandle<()> {
         let socket = socket.to_path_buf();
@@ -306,16 +306,17 @@ mod tests {
             for incoming in listener.incoming() {
                 if let Ok(mut s) = incoming {
                     thread::spawn(move || {
-                        let mut req = [0u8; HEADER_LEN + 1];
+                        let mut req = [0u8; HEADER_LEN + 10];
                         if (&s).read_exact(&mut req).is_err() {
                             return;
                         }
-                        // RESP: payload_len=1, kind=Hello, cid=echo req cid
-                        let mut resp = [0u8; HEADER_LEN + 1];
-                        resp[..4].copy_from_slice(&1u32.to_be_bytes());
+                        // RESP: major + capabilities
+                        let mut resp = [0u8; HEADER_LEN + 9];
+                        resp[..4].copy_from_slice(&9u32.to_be_bytes());
                         resp[4] = FrameType::Hello as u8;
                         resp[5..13].copy_from_slice(&req[5..13]);
                         resp[13] = PROTOCOL_MAJOR;
+                        resp[14..22].copy_from_slice(&hi_kafka_proto::CAP_ALL.to_be_bytes());
                         let _ = s.write_all(&resp);
                         // 挂着等客户端 close
                         let mut sink = [0u8; 64];

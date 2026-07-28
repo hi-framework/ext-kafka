@@ -40,7 +40,6 @@ pub enum SpawnError {
 /// 启动配置
 pub struct SpawnConfig {
     pub socket: PathBuf,
-    pub brokers: Option<String>,
     pub log_level: String,
     pub log_file: Option<PathBuf>,
     /// worker 收到 SIGTERM 后排干 in-flight 连接的超时
@@ -54,7 +53,6 @@ impl SpawnConfig {
     pub fn from_env(socket: PathBuf) -> Self {
         Self {
             socket,
-            brokers: std::env::var("HI_KAFKA_BROKERS").ok(),
             log_level: crate::ini_config::log_level(),
             log_file: crate::ini_config::log_file(),
             drain_timeout: Duration::from_millis(crate::ini_config::drain_timeout_ms()),
@@ -65,7 +63,6 @@ impl SpawnConfig {
     fn to_child_config(&self) -> ChildConfig {
         ChildConfig {
             socket: self.socket.clone(),
-            brokers: self.brokers.clone(),
             log_level: self.log_level.clone(),
             log_file: self.log_file.clone(),
             drain_timeout: self.drain_timeout,
@@ -287,8 +284,8 @@ mod tests {
 
     #[test]
     fn test_lock_path_for() {
-        let p = lock_path_for(Path::new("/tmp/hi-kafka.sock"));
-        assert_eq!(p, PathBuf::from("/tmp/hi-kafka.sock.spawn-lock"));
+        let p = lock_path_for(Path::new("/tmp/hi-kafka-v2.sock"));
+        assert_eq!(p, PathBuf::from("/tmp/hi-kafka-v2.sock.spawn-lock"));
     }
 
     #[test]

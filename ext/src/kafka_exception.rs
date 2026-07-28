@@ -75,6 +75,16 @@ zend_fastcall! {
     }
 }
 
+zend_fastcall! {
+    extern fn get_outcome(ex: &mut ExecuteData, retval: &mut Zval) {
+        let v = ex
+            .get_self()
+            .and_then(|o| o.get_property::<String>("outcome").ok())
+            .unwrap_or_else(|| "not_applied".to_string());
+        let _ = retval.set_string(&v, false);
+    }
+}
+
 /// MINIT 阶段注册 `Hi\Kafka\KafkaException`。幂等。
 pub fn register() {
     if EXC_CE.get().is_some() {
@@ -96,16 +106,22 @@ pub fn register() {
         .returns(DataType::Long, false, false)
         .build()
         .expect("build getNativeCode");
+    let get_outcome_m = FunctionBuilder::new("getOutcome", get_outcome)
+        .returns(DataType::String, false, false)
+        .build()
+        .expect("build getOutcome");
 
     let ce = ClassBuilder::new("Hi\\Kafka\\KafkaException")
         .extends(ce::exception())
         .property("kind", 0i64, PropertyFlags::Public)
         .property("kind_name", "", PropertyFlags::Public)
         .property("retryable", false, PropertyFlags::Public)
+        .property("outcome", "not_applied", PropertyFlags::Public)
         .property("native_code", 0i64, PropertyFlags::Public)
         .method(get_kind_m, MethodFlags::Public)
         .method(get_kind_name_m, MethodFlags::Public)
         .method(is_retryable_m, MethodFlags::Public)
+        .method(get_outcome_m, MethodFlags::Public)
         .method(get_native_code_m, MethodFlags::Public)
         .build()
         .expect("failed to register Hi\\Kafka\\KafkaException");
@@ -126,6 +142,7 @@ pub fn build_zval(
     kind: i64,
     kind_name: &str,
     retryable: bool,
+    outcome: &str,
     native_code: i64,
 ) -> Option<Zval> {
     let ce = EXC_CE.get().map(|r| r.0)?;
@@ -137,6 +154,7 @@ pub fn build_zval(
     obj.set_property("kind", kind).ok()?;
     obj.set_property("kind_name", kind_name).ok()?;
     obj.set_property("retryable", retryable).ok()?;
+    obj.set_property("outcome", outcome).ok()?;
     obj.set_property("native_code", native_code).ok()?;
     obj.into_zval(false).ok()
 }

@@ -26,7 +26,6 @@ use tracing_subscriber::EnvFilter;
 #[derive(Debug, Clone)]
 pub struct ChildConfig {
     pub socket: PathBuf,
-    pub brokers: Option<String>,
     pub log_level: String,
     pub log_file: Option<PathBuf>,
     pub drain_timeout: Duration,
@@ -133,19 +132,10 @@ async fn run_server(config: ChildConfig) -> anyhow::Result<()> {
 
     let registry = ClusterRegistry::new();
 
-    // 兼容：若旧式 brokers 存在（标准用法是 PHP 端 registerCluster），
-    // 启动期把 'default' 集群预注册一份，方便老业务无缝迁移。
-    if let Some(brokers) = config.brokers.as_deref() {
-        let mut cfg = std::collections::HashMap::new();
-        cfg.insert("bootstrap.servers".to_string(), brokers.to_string());
-        registry.register("default".to_string(), cfg).await;
-        info!(%brokers, "preregistered 'default' cluster from env");
-    }
-
     let producer = build_producer(registry.clone());
     let shutdown = ShutdownState::new();
     let m = Metrics::new();
-    let consumer = build_consumer(registry.clone(), m.clone());
+    let consumer = build_consumer(registry.clone(), shutdown.clone(), m.clone());
 
     if let Some(addr) = config.metrics_addr {
         let m_clone = m.clone();
@@ -271,19 +261,19 @@ fn build_producer(
 #[cfg(feature = "kafka")]
 fn build_consumer(
     registry: hi_kafka_worker::ClusterRegistryHandle,
+    shutdown: hi_kafka_worker::ShutdownHandle,
     metrics: std::sync::Arc<hi_kafka_worker::Metrics>,
 ) -> hi_kafka_worker::ConsumerHandle {
-    use hi_kafka_worker::consumer::{KafkaConsumer, KafkaConsumerConfig};
-    use std::sync::Arc;
-    Arc::new(KafkaConsumer::new(registry, KafkaConsumerConfig::default()).with_metrics(metrics))
+    hi_kafka_worker::consumer::kafka(registry, shutdown, metrics)
 }
 
 #[cfg(not(feature = "kafka"))]
 fn build_consumer(
     _registry: hi_kafka_worker::ClusterRegistryHandle,
-    _metrics: std::sync::Arc<hi_kafka_worker::Metrics>,
+    shutdown: hi_kafka_worker::ShutdownHandle,
+    metrics: std::sync::Arc<hi_kafka_worker::Metrics>,
 ) -> hi_kafka_worker::ConsumerHandle {
-    hi_kafka_worker::consumer::logging()
+    hi_kafka_worker::consumer::logging(shutdown, metrics)
 }
 
 // 抑制 CString import 警告（保留供未来使用）
