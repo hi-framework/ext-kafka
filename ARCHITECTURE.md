@@ -572,7 +572,14 @@ framework 若为旧业务提供关联数组视图，必须同时提供无损重�
 - 不创建 array<array{message}>；
 - key、value、headers SHOULD 惰性 materialize；
 - 消费热路径禁止 copy_to_bytes → to_vec → PHP string 的连续复制；detach 后的 SourceRecord 与 encoded payload 允许在编码瞬间短暂重叠，但两份 wire image 必须在复制前同时取得全局 byte permits，编码完成立即释放 transient 一份；
-- PHP 请求字符串时允许一次不可避免的 PHP ownership copy。
+- PHP 请求字符串时允许一次不可避免的 PHP ownership copy；
+- native `next()` 与 coroutine `hi_kafka_decode_stream_frame()` 创建的 owned Zend object
+  必须各自向返回 zval **转移且仅转移一个引用**；PHP 变量被覆盖或 `unset` 后，
+  `ConsumerRecord` 的 Rust backing、key/value/header allocations 必须立即可释放，不得依赖
+  GC cycle、stream close 或进程退出；
+- 当前绑定层不得降级到 `ext-php-rs < 0.15.13`，这些版本的
+  `ZBox<ZendClassObject<T>>` 转换存在已知的单引用泄漏。升级或替换 PHP binding 时，
+  必须先通过第 26.3 节的 native 与 coroutine 引用所有权回归测试。
 
 ### 11.6 Consumer 热路径
 
@@ -757,6 +764,8 @@ bounded librdkafka fetch queue
 - buffer 满时等待或 pause，绝不 pop_front/drop；
 - connection reusable buffer 按容量等级回收；
 - RSS 允许存在 allocator high-water，但经过 warm-up 后不能随处理总量线性增长。
+- 即使 payload 很小、worker RSS 有界，也必须单独验证 PHP Zend object/refcount；
+  每条消息固定泄漏一个小对象同样属于无界内存，不能被 byte credit 模型掩盖。
 
 ## 16. Rebalance
 
@@ -1089,7 +1098,16 @@ PHP driver 暴露：
 
 分别测量 PHP 与 worker RSS。warm-up 后 RSS 必须位于配置预算加文档化 allocator tolerance 内，且对累计处理条数无正线性斜率。
 
-仓库中的 `scripts/run-consumer-memory-e2e.sh` 是该门禁的标准入口：默认流过 2048 × 64 KiB，检查 PHP peak、worker peak RSS，以及完成前 25% warm-up 后的 RSS 增长。
+仓库中的 `scripts/run-consumer-memory-e2e.sh` 是大 payload/worker 预算门禁的标准入口：
+默认流过 2048 × 64 KiB，检查 PHP peak、worker peak RSS，以及完成前 25% warm-up
+后的 RSS 增长。
+
+`consumer-record-memory-v2.php` 与 `consumer-record-memory-swoole-v2.php` 是 Zend
+引用所有权门禁：默认各自在单个 PHP 进程内顺序消费 50,000 条小消息，不保存消息数组，
+预热后 PHP 内存增长不得超过 4 MiB。前者必须覆盖 native `ConsumerStream::next()`，
+后者必须在加载 Swoole 时覆盖 `SwooleConsumerTransport` +
+`hi_kafka_decode_stream_frame()`；Swow transport 共享相同 decoder，但发布环境具备 Swow
+工具链时也必须运行同等门禁。
 
 ### 26.4 吞吐与延迟
 
