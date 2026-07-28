@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 真实 Kafka 端到端：worker --features kafka + 本地 broker，PHP 发消息，
+# 真实 Kafka 端到端：worker --features kafka + 显式 RegisterCluster，PHP 发消息，
 # kafka-console-consumer 验证收到。
 set -euo pipefail
 
@@ -36,9 +36,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "==> 启动 worker (socket=$SOCKET, brokers=$BROKER)"
+echo "==> 启动 worker (socket=$SOCKET)"
 rm -f "$SOCKET"
-./target/debug/hi-kafka-worker --socket "$SOCKET" --brokers "$BROKER" --log-level info > "$LOG" 2>&1 &
+./target/debug/hi-kafka-worker --socket "$SOCKET" --log-level info > "$LOG" 2>&1 &
 WORKER_PID=$!
 
 for i in {1..30}; do
@@ -60,8 +60,10 @@ sleep 1
 
 echo "==> PHP 发 3 条消息到 topic=$TOPIC"
 php -d extension="$EXT_PATH" -r "
+    \$client = new Hi\\Kafka\\Client('$SOCKET');
+    \$client->registerCluster('default', ['bootstrap.servers' => '$BROKER']);
     for (\$i = 1; \$i <= 3; \$i++) {
-        hi_kafka_produce_fnf('$SOCKET', 'default', '$TOPIC', 'key-' . \$i, 'value-' . \$i);
+        \$client->produceFnf('default', '$TOPIC', 'key-' . \$i, 'value-' . \$i);
     }
     echo 'sent 3 messages' . PHP_EOL;
 "

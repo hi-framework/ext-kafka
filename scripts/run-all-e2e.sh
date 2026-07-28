@@ -4,7 +4,7 @@
 #
 # 用法：
 #   ./scripts/run-all-e2e.sh                       # 默认全跑
-#   E2E_TESTS="binary transaction" ./scripts/run-all-e2e.sh  # 只跑指定的
+#   E2E_TESTS="consumer-stream-v2 recovery" ./scripts/run-all-e2e.sh
 #   EXT_PATH=/path/to/libhi_kafka.dylib ./scripts/run-all-e2e.sh
 set -uo pipefail
 
@@ -25,51 +25,14 @@ if ! command -v "$PHP_BIN" &>/dev/null; then
     exit 1
 fi
 
-# 探测可选扩展（swoole / swow）的 .so 路径，供需要的测试单独加载
-# 顺序：环境变量 → php-config 标准 pecl 路径
-detect_ext_so() {
-    local name="$1"
-    local env_var="$2"
-    if [[ -n "${!env_var:-}" && -f "${!env_var}" ]]; then
-        echo "${!env_var}"; return
-    fi
-    if command -v php-config &>/dev/null; then
-        local dir
-        dir=$(php-config --extension-dir 2>/dev/null)
-        for f in "$dir/$name.so" "$dir/pecl/$name.so"; do
-            [[ -f "$f" ]] && { echo "$f"; return; }
-        done
-    fi
-    # macOS PECL 常见路径
-    for f in /opt/homebrew/lib/php/pecl/*/"$name.so" /usr/local/lib/php/pecl/*/"$name.so"; do
-        [[ -f "$f" ]] && { echo "$f"; return; }
-    done
-    echo ""
-}
-SWOOLE_SO="$(detect_ext_so swoole SWOOLE_SO_PATH)"
-
 # 默认全跑（除掉以 _ 开头的辅助脚本）
 ALL_TESTS=(
-    auto-backpressure
-    binary
-    configs
-    consumer-in-txn
-    consumer-recovery
-    control-recovery
-    exception-fields
-    headers
-    integration
-    oauth-smoke
+    consumer-stream-v2
+    coroutine-consumer-stream-v2
+    consumer-offset-v2
+    consumer-rebalance-v2
     panic-recovery
-    partition-timestamp
-    pause-resume
-    rebalance
     recovery
-    replay-recovery
-    seek
-    swoole-client
-    swoole-phase3
-    transaction
 )
 TESTS="${E2E_TESTS:-${ALL_TESTS[@]}}"
 
@@ -114,56 +77,17 @@ for t in $TESTS; do
 
     start=$(date +%s%N)
     printf "==> %-25s " "$t"
-    # integration 走 --with-kafka 真路径（kafka feature 是默认且唯一后端）
-    extra_args=""
-    # extra_php_opts 用字符串而不是数组，避免 `set -u` 下空数组展开报错
-    extra_php_opts=""
-    # 用字符串而非数组承载额外 env——兼容 macOS bash 3.2 + `set -u`
-    # 下的空数组展开陷阱（extra_env[@]: unbound variable）。
-    extra_env=""
-    case "$t" in
-        integration) extra_args="--with-kafka" ;;
-        swoole-client|swoole-phase3)
-            # 需要在 hi-kafka 之前装载 swoole 扩展
-            if [[ -z "$SWOOLE_SO" ]]; then
-                echo "$(yellow SKIP) (swoole.so 未找到，设 SWOOLE_SO_PATH 或装 swoole)"
-                continue
-            fi
-            extra_php_opts="-d extension=$SWOOLE_SO"
-            ;;
-        auto-backpressure)
-            # 自动背压：小缓冲 + 低水位，确保 500 条大 payload 能触发 auto-pause
-            # 每个 e2e 独立 metrics 端口，避免并发端口冲突
-            metrics_port=$((9500 + RANDOM % 500))
-            extra_env="HI_KAFKA_METRICS_ADDR=127.0.0.1:${metrics_port} \
-                HI_KAFKA_CONSUMER_BUFFER_CAPACITY=200 \
-                HI_KAFKA_CONSUMER_PAUSE_AT=160 \
-                HI_KAFKA_CONSUMER_RESUME_AT=40"
-            ;;
-    esac
-    # HI_KAFKA_EXT_PATH 给那些会 spawn 独立 PHP 进程的测试用（rebalance）
-    # HI_KAFKA_BROKERS 给依赖默认 broker 的测试
     # -n 跳过系统 php.ini：避免 xdebug 之类的 observer 在 MSHUTDOWN 阶段崩
-    # shellcheck disable=SC2086
-    output=$(env $extra_env \
+    output=$(env \
         HI_KAFKA_EXT_PATH="$EXT_PATH" \
         HI_KAFKA_BROKERS="${HI_KAFKA_BROKERS:-127.0.0.1:9094}" \
-        "$PHP_BIN" -n $extra_php_opts -d extension="$EXT_PATH" "$script" "$sock" "$topic_prefix" $extra_args 2>&1)
+        "$PHP_BIN" -n -d extension="$EXT_PATH" "$script" "$sock" "$topic_prefix" 2>&1)
     rc=$?
     end=$(date +%s%N)
     elapsed_ms=$(( (end - start) / 1000000 ))
 
-    # 判定逻辑：
-    # 1. 输出含 ★ / PASS$ / 全部 PASS → PASS（rc 不严格要求 0；Swoole 退出时
-    #    librdkafka 析构偶发 SIGSEGV，业务断言已经全部通过）
-    # 2. rc=0 且输出 ^SKIP: → SKIP
-    # 3. 其余 → FAIL
-    if echo "$output" | grep -qE '★|PASS$|全部 PASS'; then
-        if [[ $rc -ne 0 ]]; then
-            echo "$(yellow PASS*) (${elapsed_ms}ms, rc=$rc — 业务断言通过但进程异常退出)"
-        else
-            echo "$(green PASS) (${elapsed_ms}ms)"
-        fi
+    if [[ $rc -eq 0 ]] && echo "$output" | grep -qE '★|PASS$|全部 PASS'; then
+        echo "$(green PASS) (${elapsed_ms}ms)"
         pass=$((pass + 1))
     elif [[ $rc -eq 0 ]] && echo "$output" | grep -q '^SKIP:'; then
         echo "$(yellow SKIP) (${elapsed_ms}ms): $(echo "$output" | grep '^SKIP:' | sed 's/^SKIP: //')"

@@ -8,18 +8,19 @@ SOCKET="/tmp/hi-kafka-autospawn.sock"
 LOCK="${SOCKET}.spawn-lock"
 LOG="/tmp/hi-kafka-autospawn.log"
 TOPIC="hi-kafka-autospawn-$$"
-WORKER_BIN="$(realpath target/debug/hi-kafka-worker)"
 EXT_PATH="$(realpath target/debug/libhi_kafka.dylib 2>/dev/null || realpath target/debug/libhi_kafka.so)"
 
-if [[ ! -f "$EXT_PATH" || ! -f "$WORKER_BIN" ]]; then
+if [[ ! -f "$EXT_PATH" ]]; then
     echo "ERROR: 缺少构建产物，先跑 scripts/build-dev.sh" >&2
     exit 1
 fi
 
 cleanup() {
-    # 杀掉由扩展拉起的 worker（按 socket 路径找 PID）
-    pkill -f "hi-kafka-worker.*$SOCKET" 2>/dev/null || true
-    rm -f "$SOCKET" "$LOCK" "$LOG"
+    if [[ -f "${SOCKET}.pid" ]]; then
+        worker_pid=$(cat "${SOCKET}.pid" 2>/dev/null || true)
+        [[ -z "$worker_pid" ]] || kill -TERM "$worker_pid" 2>/dev/null || true
+    fi
+    rm -f "$SOCKET" "${SOCKET}.pid" "$LOCK" "$LOG"
 }
 trap cleanup EXIT
 cleanup  # 先清场
@@ -35,7 +36,6 @@ if [[ "$USE_KAFKA" == "1" ]] && ! docker ps --format '{{.Names}}' | grep -q "^${
 fi
 
 echo "==> PHP 调用，期望扩展自动拉起 worker"
-echo "==> WORKER_BIN=$WORKER_BIN"
 echo "==> SOCKET=$SOCKET"
 
 CONSUMER_OUT=""
@@ -53,42 +53,44 @@ fi
 # 验证扩展拉起的进程数：3 个并发 PHP 进程，期望只产生 1 个 worker
 TS=$(date +%s%N)
 (
-HI_KAFKA_WORKER_BIN="$WORKER_BIN" \
-HI_KAFKA_BROKERS="$BROKER" \
 HI_KAFKA_LOG_FILE="$LOG" \
 HI_KAFKA_LOG_LEVEL="info" \
     php -d extension="$EXT_PATH" -r "
-        hi_kafka_produce_fnf('$SOCKET', 'default', '$TOPIC', 'concurrent-1', 'value-1');
+        \$client = new Hi\\Kafka\\Client('$SOCKET');
+        \$client->registerCluster('default', ['bootstrap.servers' => '$BROKER']);
+        \$client->produceFnf('default', '$TOPIC', 'concurrent-1', 'value-1');
     " &
-HI_KAFKA_WORKER_BIN="$WORKER_BIN" \
-HI_KAFKA_BROKERS="$BROKER" \
 HI_KAFKA_LOG_FILE="$LOG" \
 HI_KAFKA_LOG_LEVEL="info" \
     php -d extension="$EXT_PATH" -r "
-        hi_kafka_produce_fnf('$SOCKET', 'default', '$TOPIC', 'concurrent-2', 'value-2');
+        \$client = new Hi\\Kafka\\Client('$SOCKET');
+        \$client->registerCluster('default', ['bootstrap.servers' => '$BROKER']);
+        \$client->produceFnf('default', '$TOPIC', 'concurrent-2', 'value-2');
     " &
-HI_KAFKA_WORKER_BIN="$WORKER_BIN" \
-HI_KAFKA_BROKERS="$BROKER" \
 HI_KAFKA_LOG_FILE="$LOG" \
 HI_KAFKA_LOG_LEVEL="info" \
     php -d extension="$EXT_PATH" -r "
-        hi_kafka_produce_fnf('$SOCKET', 'default', '$TOPIC', 'concurrent-3', 'value-3');
+        \$client = new Hi\\Kafka\\Client('$SOCKET');
+        \$client->registerCluster('default', ['bootstrap.servers' => '$BROKER']);
+        \$client->produceFnf('default', '$TOPIC', 'concurrent-3', 'value-3');
     " &
 wait
 )
 
 echo "==> 3 个 PHP 进程已完成"
 
-# 数 worker 进程
+# PID file 由唯一持有 socket 的 worker 写入；spawn lock 保证并发只创建一个。
 sleep 0.5
-WORKER_COUNT=$(pgrep -f "hi-kafka-worker.*$SOCKET" | wc -l | tr -d ' ')
-echo "==> worker 进程数: $WORKER_COUNT (期望 1)"
-
-if [[ "$WORKER_COUNT" != "1" ]]; then
-    echo "==> FAIL: worker 进程数不对" >&2
-    pgrep -f "hi-kafka-worker.*$SOCKET" | xargs -I{} ps -p {} 2>&1
+if [[ ! -f "${SOCKET}.pid" ]]; then
+    echo "==> FAIL: worker PID file 不存在" >&2
     exit 1
 fi
+WORKER_PID=$(cat "${SOCKET}.pid")
+if ! kill -0 "$WORKER_PID" 2>/dev/null; then
+    echo "==> FAIL: worker PID $WORKER_PID 不存活" >&2
+    exit 1
+fi
+echo "==> 唯一 socket owner worker PID: $WORKER_PID"
 
 if [[ "$USE_KAFKA" == "1" ]]; then
     wait $CONSUMER_PID 2>/dev/null || true

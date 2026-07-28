@@ -79,22 +79,23 @@ $expected = [
     "hi_kafka_register_cluster",
     "hi_kafka_produce_fnf",
     "hi_kafka_produce_sync",
-    "hi_kafka_subscribe",
-    "hi_kafka_poll",
-    "hi_kafka_commit",
-    "hi_kafka_unsubscribe",
+    "hi_kafka_encode_consume_open_frame",
+    "hi_kafka_encode_consume_resume_frame",
+    "hi_kafka_decode_stream_frame",
 ];
 $missing = [];
 foreach ($expected as $f) {
     if (! function_exists($f)) $missing[] = $f;
 }
 if (! class_exists("Hi\\Kafka\\Client")) $missing[] = "Hi\\Kafka\\Client (class)";
+if (! class_exists("Hi\\Kafka\\ConsumerStream")) $missing[] = "Hi\\Kafka\\ConsumerStream (class)";
+if (! class_exists("Hi\\Kafka\\Message")) $missing[] = "Hi\\Kafka\\Message (class)";
 if ($missing) {
     fwrite(STDERR, "MISSING: " . implode(", ", $missing) . "\n");
     exit(1);
 }
 echo "version=" . hi_kafka_version() . PHP_EOL;
-echo "OK: " . count($expected) . " functions + 1 class" . PHP_EOL;
+echo "OK: " . count($expected) . " functions + 3 classes" . PHP_EOL;
 ' 2>&1)
 echo "$api_check" | sed 's/^/  /'
 if echo "$api_check" | grep -q MISSING; then
