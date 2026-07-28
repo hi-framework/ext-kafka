@@ -28,6 +28,8 @@ fi
 # 默认全跑（除掉以 _ 开头的辅助脚本）
 ALL_TESTS=(
     consumer-stream-v2
+    consumer-record-memory-v2
+    consumer-record-memory-swoole-v2
     coroutine-consumer-stream-v2
     consumer-offset-v2
     consumer-rebalance-v2
