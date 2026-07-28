@@ -27,9 +27,11 @@ pub fn register() {
     if IFACE_CE.get().is_some() {
         return;
     }
-    let ce = ClassBuilder::new("Hi\\Kafka\\ConsumerStreamInterface")
+    ClassBuilder::new("Hi\\Kafka\\ConsumerStreamInterface")
         .flags(ClassFlags::Interface)
-        .build()
+        .registration(|ce| {
+            let _ = IFACE_CE.set(CeRef(ce));
+        })
+        .register()
         .expect("failed to register Hi\\Kafka\\ConsumerStreamInterface");
-    let _ = IFACE_CE.set(CeRef(ce));
 }

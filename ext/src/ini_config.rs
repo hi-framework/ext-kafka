@@ -35,22 +35,22 @@ pub fn register(module_number: i32) {
             IniEntryDef::new(
                 INI_LOG_LEVEL.into(),
                 DEFAULT_LOG_LEVEL.into(),
-                IniEntryPermission::All,
+                &IniEntryPermission::All,
             ),
             IniEntryDef::new(
                 INI_LOG_FILE.into(),
                 DEFAULT_LOG_FILE.into(),
-                IniEntryPermission::All,
+                &IniEntryPermission::All,
             ),
             IniEntryDef::new(
                 INI_DRAIN_TIMEOUT_MS.into(),
                 DEFAULT_DRAIN_TIMEOUT_MS.to_string(),
-                IniEntryPermission::All,
+                &IniEntryPermission::All,
             ),
             IniEntryDef::new(
                 INI_METRICS_ADDR.into(),
                 DEFAULT_METRICS_ADDR.into(),
-                IniEntryPermission::All,
+                &IniEntryPermission::All,
             ),
         ],
         module_number,

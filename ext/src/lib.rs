@@ -31,10 +31,9 @@ mod worker_health;
 
 use ext_php_rs::binary::Binary;
 use ext_php_rs::binary_slice::BinarySlice;
-use ext_php_rs::boxed::ZBox;
 use ext_php_rs::convert::IntoZval;
 use ext_php_rs::prelude::*;
-use ext_php_rs::types::{ZendClassObject, ZendHashTable, ZendObject, Zval};
+use ext_php_rs::types::{ZendClassObject, ZendHashTable, Zval};
 
 pub use client::Client;
 pub use consumer_stream::{ConsumerRecord, ConsumerStream};
@@ -854,28 +853,17 @@ fn put<V: IntoZval>(ht: &mut ZendHashTable, key: &str, value: V) -> PhpResult<()
         .map_err(|e| PhpException::default(format!("{key}: {e}")))
 }
 
-/// MINIT 钩子：注册 hi_kafka.* 几项 ini 给运维侧用。
-///
-/// X：必须用 `#[php_startup]` 而不是手动 `.startup_function(...)`。
-/// 原因：ext-php-rs 0.13 检测到 `#[php_class]` 时会自动生成一个 startup 函数注册类；
-/// 用户手动 `module.startup_function(fn)` 会覆盖那个自动 startup，导致 `Hi\Kafka\Client`
-/// 这种 `#[php_class]` 类不被注册（PHP 端 `class_exists("Hi\\Kafka\\Client") === false`）。
-/// 正确用法是把业务 ini 注册逻辑放进 `#[php_startup]` 标记的函数体内——宏会把它
-/// **合并**进 class 注册的同一个 startup 里。
-///
-/// 函数体里 `module_number` 是宏内部 `fn internal(ty, module_number)` 的参数名，
-/// 直接引用即可（不需要在签名里声明）。
+/// MINIT 前置钩子：注册 runtime interface、异常类和 hi_kafka.* INI 项。
 ///
 /// **顺序约束**：`client_interface::register()` 必须在 `#[php_class]` 类注册之前
-/// 完成——`Hi\Kafka\Client` 的 `#[implements(crate::client_interface::get_ce())]`
-/// 在 ext-php-rs 自动生成的 class 注册块里 evaluate 那个表达式，此时 CE 必须 ready。
-/// 用 `#[php_startup(before)]` 让本函数体在 class 注册**之前**跑。
-#[php_startup(before)]
-fn module_startup() {
+/// 完成。ext-php-rs 0.14+ 的 `#[php(startup = ...)]` 包装器先调用本函数，随后才
+/// 注册 `ModuleBuilder` 中声明的类，因此类解析 `get_ce()` 时 interface 已存在。
+fn module_startup(_type: i32, module_number: i32) -> i32 {
     client_interface::register();
     consumer_stream_interface::register();
     kafka_exception::register();
     ini_config::register(module_number);
+    0
 }
 
 /// MSHUTDOWN 钩子：PHP 进程退出时主动通知所用过的 worker 自退（见 [`lifecycle`]）。
@@ -891,6 +879,46 @@ extern "C" fn module_shutdown(_type: i32, _module_number: i32) -> i32 {
 }
 
 #[php_module]
+#[php(startup = "module_startup")]
 pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
-    module.shutdown_function(module_shutdown)
+    // ext-php-rs 0.14+ 不再通过全局 inventory 隐式发现导出项；这里是扩展公开
+    // PHP API 的唯一注册清单，新增 `#[php_function]` / `#[php_class]` 时必须同步加入。
+    module
+        .function(wrap_function!(hi_kafka_version))
+        .function(wrap_function!(hi_kafka_ensure_worker))
+        .function(wrap_function!(hi_kafka_register_cluster))
+        .function(wrap_function!(hi_kafka_produce_fnf))
+        .function(wrap_function!(hi_kafka_produce_sync))
+        .function(wrap_function!(hi_kafka_pool_stats))
+        .function(wrap_function!(hi_kafka_retry_stats))
+        .function(wrap_function!(hi_kafka_runtime))
+        .function(wrap_function!(hi_kafka_next_cid))
+        .function(wrap_function!(hi_kafka_header_len))
+        .function(wrap_function!(hi_kafka_error_frame_kind))
+        .function(wrap_function!(hi_kafka_decode_error_frame))
+        .function(wrap_function!(hi_kafka_encode_hello_frame))
+        .function(wrap_function!(hi_kafka_verify_hello_resp))
+        .function(wrap_function!(hi_kafka_encode_fnf_frame))
+        .function(wrap_function!(hi_kafka_encode_req_frame))
+        .function(wrap_function!(hi_kafka_parse_header))
+        .function(wrap_function!(hi_kafka_decode_resp_frame))
+        .function(wrap_function!(hi_kafka_encode_register_cluster_frame))
+        .function(wrap_function!(hi_kafka_decode_control_resp))
+        .function(wrap_function!(hi_kafka_encode_set_oauth_token_frame))
+        .function(wrap_function!(hi_kafka_encode_consume_open_frame))
+        .function(wrap_function!(hi_kafka_encode_consume_resume_frame))
+        .function(wrap_function!(hi_kafka_encode_consume_ack_frame))
+        .function(wrap_function!(hi_kafka_encode_consume_nack_frame))
+        .function(wrap_function!(hi_kafka_encode_flow_frame))
+        .function(wrap_function!(hi_kafka_encode_consume_commit_frame))
+        .function(wrap_function!(hi_kafka_encode_consume_close_frame))
+        .function(wrap_function!(hi_kafka_encode_consume_pause_frame))
+        .function(wrap_function!(
+            hi_kafka_encode_consume_partition_resume_frame
+        ))
+        .function(wrap_function!(hi_kafka_decode_stream_frame))
+        .class::<Client>()
+        .class::<ConsumerRecord>()
+        .class::<ConsumerStream>()
+        .shutdown_function(module_shutdown)
 }

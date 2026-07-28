@@ -52,9 +52,11 @@ pub fn register() {
     if IFACE_CE.get().is_some() {
         return;
     }
-    let ce = ClassBuilder::new("Hi\\Kafka\\ClientInterface")
+    ClassBuilder::new("Hi\\Kafka\\ClientInterface")
         .flags(ClassFlags::Interface)
-        .build()
+        .registration(|ce| {
+            let _ = IFACE_CE.set(CeRef(ce));
+        })
+        .register()
         .expect("failed to register Hi\\Kafka\\ClientInterface");
-    let _ = IFACE_CE.set(CeRef(ce));
 }

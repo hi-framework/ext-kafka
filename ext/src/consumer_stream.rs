@@ -24,7 +24,8 @@ use std::time::Duration;
 
 const READ_CHUNK_BYTES: usize = 64 * 1024;
 
-#[php_class(name = "Hi\\Kafka\\ConsumerRecord")]
+#[php_class]
+#[php(name = "Hi\\Kafka\\ConsumerRecord")]
 #[derive(Debug, Clone)]
 pub struct ConsumerRecord {
     subscription_id: u64,
@@ -134,8 +135,12 @@ struct State {
     closed: bool,
 }
 
-#[php_class(name = "Hi\\Kafka\\ConsumerStream")]
-#[implements(crate::consumer_stream_interface::get_ce())]
+#[php_class]
+#[php(name = "Hi\\Kafka\\ConsumerStream")]
+#[php(implements(
+    ce = crate::consumer_stream_interface::get_ce,
+    stub = "Hi\\Kafka\\ConsumerStreamInterface"
+))]
 #[derive(Debug)]
 pub struct ConsumerStream {
     state: Mutex<State>,

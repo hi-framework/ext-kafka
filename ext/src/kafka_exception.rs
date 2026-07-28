@@ -13,7 +13,7 @@
 //! `getKindName()` / `isRetryable()` / `getNativeCode()` 四个 getter（与 composer 桩
 //! `php-driver/src/Hi/Kafka/KafkaException.php` 对齐，避免装/不装扩展时 API 漂移）。
 
-use ext_php_rs::builders::{ClassBuilder, FunctionBuilder};
+use ext_php_rs::builders::{ClassBuilder, ClassProperty, FunctionBuilder};
 use ext_php_rs::convert::IntoZval;
 use ext_php_rs::flags::{DataType, MethodFlags, PropertyFlags};
 use ext_php_rs::types::Zval;
@@ -29,6 +29,26 @@ unsafe impl Sync for CeRef {}
 unsafe impl Send for CeRef {}
 
 static EXC_CE: OnceLock<CeRef> = OnceLock::new();
+
+/// 构造手工注册类的属性元数据。
+///
+/// `KafkaException` 不参与 stub 自动生成，因此这里只描述 Zend 运行时真正需要的
+/// 可见性、类型和默认值；PHP 侧完整声明仍由 php-driver 的桩文件维护。
+fn property<T>(name: &str, value: T, ty: DataType) -> ClassProperty
+where
+    T: IntoZval + 'static,
+{
+    ClassProperty {
+        name: name.to_owned(),
+        flags: PropertyFlags::Public,
+        default: Some(Box::new(move || value.into_zval(true))),
+        docs: &[],
+        ty: Some(ty),
+        nullable: false,
+        readonly: false,
+        default_stub: None,
+    }
+}
 
 // === getter 方法（读 $this 公开属性）===
 // 手动 ClassBuilder 没有 Rust struct，方法经 ExecuteData 拿 $this、读属性、写返回值。
@@ -90,42 +110,37 @@ pub fn register() {
     if EXC_CE.get().is_some() {
         return;
     }
-    let get_kind_m = FunctionBuilder::new("getKind", get_kind)
-        .returns(DataType::Long, false, false)
-        .build()
-        .expect("build getKind");
-    let get_kind_name_m = FunctionBuilder::new("getKindName", get_kind_name)
-        .returns(DataType::String, false, false)
-        .build()
-        .expect("build getKindName");
-    let is_retryable_m = FunctionBuilder::new("isRetryable", is_retryable)
-        .returns(DataType::Bool, false, false)
-        .build()
-        .expect("build isRetryable");
-    let get_native_code_m = FunctionBuilder::new("getNativeCode", get_native_code)
-        .returns(DataType::Long, false, false)
-        .build()
-        .expect("build getNativeCode");
-    let get_outcome_m = FunctionBuilder::new("getOutcome", get_outcome)
-        .returns(DataType::String, false, false)
-        .build()
-        .expect("build getOutcome");
+    let get_kind_m =
+        FunctionBuilder::new("getKind", get_kind).returns(DataType::Long, false, false);
+    let get_kind_name_m =
+        FunctionBuilder::new("getKindName", get_kind_name).returns(DataType::String, false, false);
+    let is_retryable_m =
+        FunctionBuilder::new("isRetryable", is_retryable).returns(DataType::Bool, false, false);
+    let get_native_code_m = FunctionBuilder::new("getNativeCode", get_native_code).returns(
+        DataType::Long,
+        false,
+        false,
+    );
+    let get_outcome_m =
+        FunctionBuilder::new("getOutcome", get_outcome).returns(DataType::String, false, false);
 
-    let ce = ClassBuilder::new("Hi\\Kafka\\KafkaException")
-        .extends(ce::exception())
-        .property("kind", 0i64, PropertyFlags::Public)
-        .property("kind_name", "", PropertyFlags::Public)
-        .property("retryable", false, PropertyFlags::Public)
-        .property("outcome", "not_applied", PropertyFlags::Public)
-        .property("native_code", 0i64, PropertyFlags::Public)
+    ClassBuilder::new("Hi\\Kafka\\KafkaException")
+        .extends((ce::exception, "\\Exception"))
+        .property(property("kind", 0i64, DataType::Long))
+        .property(property("kind_name", "", DataType::String))
+        .property(property("retryable", false, DataType::Bool))
+        .property(property("outcome", "not_applied", DataType::String))
+        .property(property("native_code", 0i64, DataType::Long))
         .method(get_kind_m, MethodFlags::Public)
         .method(get_kind_name_m, MethodFlags::Public)
         .method(is_retryable_m, MethodFlags::Public)
         .method(get_outcome_m, MethodFlags::Public)
         .method(get_native_code_m, MethodFlags::Public)
-        .build()
+        .registration(|ce| {
+            let _ = EXC_CE.set(CeRef(ce));
+        })
+        .register()
         .expect("failed to register Hi\\Kafka\\KafkaException");
-    let _ = EXC_CE.set(CeRef(ce));
 }
 
 /// 构造一个**带真实调用栈**的 KafkaException 对象 zval（供 Rust 抛出路径用，

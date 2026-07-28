@@ -16,8 +16,12 @@ use ext_php_rs::prelude::*;
 use ext_php_rs::types::{ZendHashTable, Zval};
 use hi_kafka_proto::ProduceResp;
 
-#[php_class(name = "Hi\\Kafka\\Client")]
-#[implements(crate::client_interface::get_ce())]
+#[php_class]
+#[php(name = "Hi\\Kafka\\Client")]
+#[php(implements(
+    ce = crate::client_interface::get_ce,
+    stub = "Hi\\Kafka\\ClientInterface"
+))]
 #[derive(Debug)]
 pub struct Client {
     socket: String,
