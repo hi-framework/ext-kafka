@@ -3,7 +3,7 @@ resolver = "2"
 members = ["ext", "worker", "proto"]
 
 [workspace.package]
-version = "0.0.11"
+version = "0.0.12"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
