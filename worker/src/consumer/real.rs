@@ -3,18 +3,23 @@ use super::{
     SourceRecord,
 };
 use crate::cluster::{ClusterRegistryHandle, OAuthTokenSlot};
+use crate::error::WorkerError;
 use crate::watermark::PartitionKey;
 use async_trait::async_trait;
 use bytes::Bytes;
-use hi_kafka_proto::{ConsumeOpen, MessageHeader, MAX_MESSAGE_HEADERS};
+use hi_kafka_proto::{
+    ConsumeOpen, ErrorKind, MessageHeader, OperationOutcome, MAX_MESSAGE_HEADERS,
+};
 use rdkafka::client::{ClientContext, OAuthToken};
 use rdkafka::consumer::{
     BaseConsumer, CommitMode, Consumer, ConsumerContext, Rebalance, StreamConsumer,
 };
+use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::message::{Headers, Message};
 use rdkafka::topic_partition_list::TopicPartitionList;
 use rdkafka::{ClientConfig, Offset};
 use std::sync::{Arc, Mutex};
+use tracing::warn;
 
 pub struct KafkaSourceFactory {
     registry: ClusterRegistryHandle,
@@ -178,11 +183,36 @@ impl ConsumerSource for KafkaSource {
         // borrowed record there are deliberately no more awaits: budget
         // acquisition is try-only, so actor command cancellation cannot drop
         // a record after advancing the librdkafka fetch position.
-        let message = self
-            .consumer
-            .recv()
-            .await
-            .map_err(|e| ConsumerError::Backend(anyhow::anyhow!(e)))?;
+        let message = loop {
+            match self.consumer.recv().await {
+                Ok(message) => break message,
+                Err(error) if is_recoverable_consumer_error(&error) => {
+                    warn!(
+                        error = %error,
+                        native_code = error.rdkafka_error_code().map_or(0, |code| code as i32),
+                        "transient Kafka consumer error; keeping subscription alive"
+                    );
+
+                    // recv() can run rebalance callbacks before yielding an error. Return
+                    // those notices to the actor before polling Kafka again so ownership
+                    // changes are never hidden behind a broker reconnect loop.
+                    let notices = self.drain_notices();
+                    if !notices.is_empty() {
+                        return Ok(SourceRead::RebalancePending {
+                            notices,
+                            record: None,
+                            blocked: None,
+                        });
+                    }
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => {
+                    return Err(ConsumerError::Backend(anyhow::Error::new(
+                        kafka_consumer_error_to_worker(&error),
+                    )));
+                }
+            }
+        };
 
         // Rebalance callbacks run inside recv(). A callback and a fetched
         // record can therefore become visible together. Detach at most this
@@ -361,6 +391,59 @@ impl ConsumerSource for KafkaSource {
     }
 }
 
+fn is_recoverable_consumer_error(error: &KafkaError) -> bool {
+    matches!(
+        error,
+        KafkaError::MessageConsumption(code) if is_recoverable_consumer_code(code)
+    )
+}
+
+fn is_recoverable_consumer_code(code: &RDKafkaErrorCode) -> bool {
+    use RDKafkaErrorCode::*;
+    matches!(
+        code,
+        BrokerDestroy
+            | BrokerTransportFailure
+            | Resolve
+            | AllBrokersDown
+            | OperationTimedOut
+            | RequestTimedOut
+            | NetworkException
+            | LeaderNotAvailable
+            | NotLeaderForPartition
+            | BrokerNotAvailable
+            | CoordinatorLoadInProgress
+            | CoordinatorNotAvailable
+            | NotCoordinator
+            | RebalanceInProgress
+    )
+}
+
+fn kafka_consumer_error_to_worker(error: &KafkaError) -> WorkerError {
+    use RDKafkaErrorCode::*;
+
+    let code = error.rdkafka_error_code();
+    let retryable = is_recoverable_consumer_error(error);
+    let kind = match code {
+        Some(SaslAuthenticationFailed) => ErrorKind::Authentication,
+        Some(TopicAuthorizationFailed | GroupAuthorizationFailed | ClusterAuthorizationFailed) => {
+            ErrorKind::Authorization
+        }
+        Some(OffsetOutOfRange) => ErrorKind::OffsetInvalid,
+        Some(UnknownTopicOrPartition) => ErrorKind::UnknownTopicOrPartition,
+        Some(_) if retryable => ErrorKind::BrokerRetryable,
+        _ => ErrorKind::Internal,
+    };
+
+    WorkerError {
+        kind,
+        retryable,
+        outcome: OperationOutcome::NotApplied,
+        native_code: code.map_or(0, |value| value as i32),
+        message: error.to_string(),
+    }
+}
+
 fn control_tpl(
     consumer: &StreamConsumer<KafkaContext>,
     partitions: &[(String, i32)],
@@ -375,4 +458,52 @@ fn control_tpl(
         tpl.add_partition(topic, *partition);
     }
     Ok(tpl)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_failures_are_recoverable() {
+        for code in [
+            RDKafkaErrorCode::BrokerTransportFailure,
+            RDKafkaErrorCode::AllBrokersDown,
+            RDKafkaErrorCode::OperationTimedOut,
+            RDKafkaErrorCode::NetworkException,
+            RDKafkaErrorCode::RebalanceInProgress,
+        ] {
+            let error = KafkaError::MessageConsumption(code);
+            assert!(
+                is_recoverable_consumer_error(&error),
+                "{code:?} should keep the consumer alive"
+            );
+        }
+    }
+
+    #[test]
+    fn fatal_consumption_error_is_not_recoverable() {
+        let error = KafkaError::MessageConsumptionFatal(RDKafkaErrorCode::BrokerTransportFailure);
+        assert!(!is_recoverable_consumer_error(&error));
+    }
+
+    #[test]
+    fn consumer_error_preserves_structured_metadata() {
+        let transport = KafkaError::MessageConsumption(RDKafkaErrorCode::BrokerTransportFailure);
+        let response = kafka_consumer_error_to_worker(&transport).to_error_resp();
+        assert_eq!(response.kind, ErrorKind::BrokerRetryable);
+        assert!(response.retryable);
+        assert_eq!(response.native_code, -195);
+        assert_eq!(response.message, transport.to_string());
+
+        let authentication =
+            KafkaError::MessageConsumptionFatal(RDKafkaErrorCode::SaslAuthenticationFailed);
+        let response = kafka_consumer_error_to_worker(&authentication).to_error_resp();
+        assert_eq!(response.kind, ErrorKind::Authentication);
+        assert!(!response.retryable);
+        assert_eq!(
+            response.native_code,
+            RDKafkaErrorCode::SaslAuthenticationFailed as i32
+        );
+    }
 }
