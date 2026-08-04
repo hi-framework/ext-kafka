@@ -547,13 +547,20 @@ impl ConsumerManager {
         request: hi_kafka_proto::ConsumeResume,
         outbound: mpsc::Sender<OutboundFrame>,
     ) -> Result<ConsumerAttachment, ConsumerError> {
-        let handle = self
-            .subscriptions
-            .lock()
-            .await
-            .get(&request.subscription_id)
-            .cloned()
-            .ok_or(ConsumerError::SubscriptionNotFound(request.subscription_id))?;
+        let handle = {
+            let mut subscriptions = self.subscriptions.lock().await;
+            let handle = subscriptions.get(&request.subscription_id).cloned();
+            if handle
+                .as_ref()
+                .is_some_and(|value| value.session.commands.is_closed())
+            {
+                subscriptions.remove(&request.subscription_id);
+                None
+            } else {
+                handle
+            }
+        }
+        .ok_or(ConsumerError::SubscriptionNotFound(request.subscription_id))?;
         if !constant_time_eq(&handle.token.0, &request.resume_token.0) {
             return Err(ConsumerError::InvalidResumeToken);
         }
@@ -569,8 +576,10 @@ impl ConsumerManager {
                 reply,
             })
             .await
-            .map_err(|_| ConsumerError::ResumeExpired)?;
-        let state = response.await.map_err(|_| ConsumerError::ActorStopped)??;
+            .map_err(|_| ConsumerError::SubscriptionNotFound(request.subscription_id))?;
+        let state = response
+            .await
+            .map_err(|_| ConsumerError::SubscriptionNotFound(request.subscription_id))??;
         Metrics::inc(&self.metrics.consumer_resume_stream_total);
         Ok(ConsumerAttachment {
             ready: state.ready,
