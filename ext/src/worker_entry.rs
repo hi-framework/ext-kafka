@@ -189,6 +189,7 @@ async fn run_server(config: ChildConfig) -> anyhow::Result<()> {
         shutdown_for_sig.start_draining();
     });
 
+    let socket_identity = server.socket_identity();
     if let Err(e) = server.run(config.drain_timeout).await {
         error!(error = ?e, "server exited with error");
     }
@@ -196,8 +197,9 @@ async fn run_server(config: ChildConfig) -> anyhow::Result<()> {
         error!(error = ?e, "producer flush during shutdown failed");
     }
 
-    let _ = std::fs::remove_file(&config.socket);
-    let _ = std::fs::remove_file(pid_file_for(&config.socket));
+    // drain 期间可能已有新 worker 在同一路径 bind：只删除自己的 socket 与 pid 文件。
+    server::remove_socket_if_owned(&config.socket, socket_identity);
+    remove_pid_file_if_owned(&pid_file);
     info!("hi-kafka worker (embedded) stopped");
     Ok(())
 }
@@ -226,6 +228,16 @@ fn pid_file_for(socket: &std::path::Path) -> std::path::PathBuf {
     name.push(".pid");
     p.set_file_name(name);
     p
+}
+
+fn remove_pid_file_if_owned(path: &std::path::Path) {
+    let ours = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|content| content.trim().parse::<u32>().ok())
+        == Some(std::process::id());
+    if ours {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 fn write_pid_file(path: &std::path::Path) -> std::io::Result<()> {

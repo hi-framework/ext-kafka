@@ -85,6 +85,7 @@ async fn main() -> anyhow::Result<()> {
     .await
     .context("bind UDS")?;
 
+    let socket_identity = server.socket_identity();
     let drain_timeout = Duration::from_millis(cli.drain_timeout_ms);
 
     // P0 #1：信号触发 shutdown，server.run 自己 drain 全部 in-flight connection task。
@@ -117,10 +118,9 @@ async fn main() -> anyhow::Result<()> {
         "drain complete"
     );
 
-    if let Err(e) = std::fs::remove_file(&cli.socket) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            error!(error = ?e, path = %cli.socket.display(), "failed to remove socket file");
-        }
+    // drain 期间可能已有新 worker 在同一路径 bind，只删除自己的 socket 文件。
+    if !server::remove_socket_if_owned(&cli.socket, socket_identity) {
+        info!(path = %cli.socket.display(), "socket file no longer ours; leaving it in place");
     }
 
     info!("hi-kafka-worker stopped");

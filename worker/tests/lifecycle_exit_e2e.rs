@@ -153,3 +153,68 @@ async fn test_idle_exit_without_goodbye() {
     );
     let _ = std::fs::remove_file(&socket);
 }
+
+/// Goodbye 只对发出时已存在的连接生效：之后接入的新使用者（例如新 FPM 子进程）
+/// 没有告别就断开时，worker 不能因为很久以前某个进程的 Goodbye 而立即退出。
+#[tokio::test]
+async fn test_goodbye_does_not_apply_to_later_connections() {
+    let (socket, shutdown) = start_worker(Duration::from_secs(60)).await;
+
+    let mut client_a = connect_handshake(&socket).await;
+    send_goodbye(&mut client_a).await;
+    drop(client_a);
+    assert!(wait_draining(&shutdown, Duration::from_secs(3)).await);
+    let _ = std::fs::remove_file(&socket);
+
+    let (socket, shutdown) = start_worker(Duration::from_secs(60)).await;
+    let mut client_a = connect_handshake(&socket).await;
+    let client_b = connect_handshake(&socket).await;
+    send_goodbye(&mut client_a).await;
+    drop(client_a);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // 新使用者接入后又直接断开（没有 Goodbye）。
+    let client_c = connect_handshake(&socket).await;
+    drop(client_c);
+    drop(client_b);
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(
+        !shutdown.is_draining(),
+        "Goodbye 之后接入的连接未告别即断开，应走 idle 超时而不是立即退出"
+    );
+    let _ = std::fs::remove_file(&socket);
+}
+
+/// drain 时空闲的 RPC 连接必须被及时关闭，而不是拖满 drain_timeout。
+#[tokio::test]
+async fn test_drain_closes_idle_rpc_connections_promptly() {
+    let socket = temp_socket();
+    let shutdown = ShutdownState::new();
+    let server = Server::bind_with(
+        &socket,
+        hi_kafka_worker::producer::logging(),
+        hi_kafka_worker::consumer::logging(shutdown.clone(), Metrics::new()),
+        ClusterRegistry::new(),
+        shutdown.clone(),
+        Metrics::new(),
+        Duration::ZERO,
+    )
+    .await
+    .unwrap();
+    let run = tokio::spawn(server.run(Duration::from_secs(30)));
+
+    let mut idle = connect_handshake(&socket).await;
+    shutdown.start_draining();
+
+    let mut byte = [0u8; 1];
+    let read = tokio::time::timeout(Duration::from_secs(2), idle.read(&mut byte))
+        .await
+        .expect("idle connection must be closed promptly during drain");
+    assert_eq!(read.unwrap(), 0, "expected EOF");
+    tokio::time::timeout(Duration::from_secs(2), run)
+        .await
+        .expect("server must finish draining without waiting for drain_timeout")
+        .unwrap()
+        .unwrap();
+    let _ = std::fs::remove_file(&socket);
+}

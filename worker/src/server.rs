@@ -36,6 +36,35 @@ pub struct Server {
     /// 无任何连接且持续空闲超过此时长 → worker 自动 drain 退出（解决主进程退出后
     /// worker 残留）。`Duration::ZERO` = 禁用（常驻，旧行为）。
     idle_timeout: Duration,
+    socket_identity: SocketIdentity,
+}
+
+/// bind 时 socket 文件的 (dev, ino)。退出时据此判断路径上的文件是否仍是自己的。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SocketIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+fn identity_of(path: &Path) -> Option<SocketIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path)
+        .ok()
+        .map(|meta| SocketIdentity {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        })
+}
+
+/// 仅当路径上仍是本 worker bind 的 socket 文件时删除，返回是否删除。
+///
+/// 旧 worker drain 期间已停止 accept，客户端会拉起新 worker 并在同一路径重新 bind；
+/// 旧 worker 退出时无条件删除会让新 worker 的 socket 消失、变得不可达。
+pub fn remove_socket_if_owned(path: &Path, identity: SocketIdentity) -> bool {
+    if identity_of(path) != Some(identity) {
+        return false;
+    }
+    std::fs::remove_file(path).is_ok()
 }
 
 impl Server {
@@ -81,6 +110,7 @@ impl Server {
             std::fs::create_dir_all(parent).context("create socket parent dir")?;
         }
         let listener = UnixListener::bind(socket).context("bind unix listener")?;
+        let socket_identity = identity_of(socket).context("stat socket file after bind")?;
         info!(socket = %socket.display(), "listening");
         Ok(Self {
             listener,
@@ -90,7 +120,13 @@ impl Server {
             shutdown,
             metrics,
             idle_timeout,
+            socket_identity,
         })
+    }
+
+    /// 本 worker bind 的 socket 文件标识，交给 [`remove_socket_if_owned`] 在退出时使用。
+    pub fn socket_identity(&self) -> SocketIdentity {
+        self.socket_identity
     }
 
     /// 主循环：accept → spawn connection task。task 句柄进 [`JoinSet`]，
@@ -105,9 +141,10 @@ impl Server {
         let mut tasks: JoinSet<()> = JoinSet::new();
         let idle_timeout = self.idle_timeout;
         let mut last_active = tokio::time::Instant::now();
-        // 收到某客户端的 Goodbye（PHP 进程退出主动告别）后置位。配合「最后一个连接
-        // 关闭」判定，让 worker 在最后使用者离开时立即自退，而不必等满 idle_timeout。
-        // 仅在启用了 idle 自退（idle_timeout > 0，即内嵌 worker）时生效。
+        // 收到客户端 Goodbye（PHP 进程退出时主动告别）后置位；有新连接接入时复位。
+        // 含义：「Goodbye 之后没有新使用者到来」。配合「最后一个连接关闭」判定，让
+        // worker 在最后的使用者离开时立即自退，而不必等满 idle_timeout；Goodbye 之后
+        // 接入、未告别就断开的使用者仍走 idle 超时。仅在启用 idle 自退时生效。
         let expedited = Arc::new(AtomicBool::new(false));
         // idle 检查间隔：idle_timeout 的 1/4，夹在 [1s, 30s]。禁用时给个无害的 30s。
         let check_interval = if idle_timeout.is_zero() {
@@ -134,6 +171,7 @@ impl Server {
                     match res {
                         Ok((stream, _addr)) => {
                             debug!("client connected");
+                            expedited.store(false, Ordering::Release);
                             Metrics::inc(&self.metrics.ipc_connections_total);
                             let producer = self.producer.clone();
                             let consumer = self.consumer.clone();
@@ -146,24 +184,21 @@ impl Server {
                                     warn!(error = ?e, "connection ended with error");
                                 }
                             });
-                            // 机会主义清理已结束的 task，避免 JoinSet 无限增长
-                            reap_finished(&mut tasks);
                         }
                         Err(e) => {
                             error!(error = ?e, "accept failed");
                         }
                     }
                 }
-                // 主动退出快路径：某连接 task 结束时立即判定。客户端 Goodbye 后紧接着
-                // 关连接 → 这里精确捕捉「最后一个连接关闭」的瞬间，无需等 idle tick。
-                // 条件：启用 idle 自退 + 收到过 Goodbye + 已无任何连接 + 无活跃订阅。
-                Some(joined) = tasks.join_next(), if !tasks.is_empty() && !idle_timeout.is_zero() => {
+                Some(joined) = tasks.join_next(), if !tasks.is_empty() => {
                     if let Err(e) = joined {
                         warn!(error = ?e, "connection task ended with error");
                     }
-                    reap_finished(&mut tasks);
-                    if expedited.load(Ordering::Acquire)
+                    // 只在这一处回收已结束的连接任务：其它分支提前回收会让「最后一个
+                    // 连接关闭」的时刻被跳过，Goodbye 快速退出因此失效。
+                    if !idle_timeout.is_zero()
                         && tasks.is_empty()
+                        && expedited.load(Ordering::Acquire)
                         && self.consumer.active_subscriptions().await == 0
                     {
                         info!("client goodbye + last connection closed, self-terminating");
@@ -171,8 +206,6 @@ impl Server {
                     }
                 }
                 _ = idle_ticker.tick(), if !idle_timeout.is_zero() => {
-                    // 清掉已结束的 connection task，才能准确判断"无连接"。
-                    reap_finished(&mut tasks);
                     if tasks.is_empty() {
                         // Dedicated stream 断开后 actor 只保留到 resume grace；仍 attached
                         // 或仍在 grace 内的 subscription 是活跃资源，不能被 idle 退出误杀。
@@ -251,15 +284,6 @@ fn check_per_frame_limit(kind: FrameType, payload_len: u32) -> anyhow::Result<()
     Ok(())
 }
 
-/// 机会主义把已结束的 task 从 JoinSet 拿出来；不阻塞。
-fn reap_finished(tasks: &mut JoinSet<()>) {
-    while let Some(res) = tasks.try_join_next() {
-        if let Err(e) = res {
-            warn!(error = ?e, "connection task ended with error");
-        }
-    }
-}
-
 async fn handle_connection(
     mut stream: UnixStream,
     producer: ProducerHandle,
@@ -277,7 +301,18 @@ async fn handle_connection(
     let mut connection_role = None;
 
     loop {
-        if let Err(e) = stream.read_exact(&mut header_buf).await {
+        // 帧与帧之间（连接空闲）才响应 drain：正在处理的请求一定会写完响应。
+        // read_exact 被取消可能丢掉已读的半个 header，但此时连接本来就要关闭。
+        let read = tokio::select! {
+            // 已到达的请求优先读：它会得到明确的 WORKER_DRAINING，而不是被直接丢弃。
+            biased;
+            read = stream.read_exact(&mut header_buf) => read,
+            _ = shutdown.wait_draining() => {
+                debug!("closing idle connection for drain");
+                return Ok(());
+            }
+        };
+        if let Err(e) = read {
             if e.kind() == std::io::ErrorKind::UnexpectedEof {
                 debug!("client disconnected");
                 return Ok(());
@@ -295,9 +330,7 @@ async fn handle_connection(
         if let Err(e) = check_per_frame_limit(header.kind, header.payload_len) {
             warn!(cid = header.cid, kind = ?header.kind, payload_len = header.payload_len,
                   "rejecting oversized frame: {e}");
-            // 把后续字节读掉以保持 stream 对齐，然后 return Err 让 connection close
-            let mut sink = vec![0u8; header.payload_len as usize];
-            let _ = stream.read_exact(&mut sink).await;
+            // 直接关连接：不必为了「对齐」再分配并读完一个超限 payload。
             return Err(e);
         }
         payload_buf.clear();

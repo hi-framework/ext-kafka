@@ -32,10 +32,13 @@ impl ShutdownState {
     }
 
     pub async fn wait_draining(&self) {
+        // 先创建 Notified 再检查标志：Notified 一旦创建就能收到 notify_waiters，
+        // 反过来的顺序会漏掉「检查之后、注册之前」发生的 start_draining。
+        let notified = self.notify.notified();
         if self.is_draining() {
             return;
         }
-        self.notify.notified().await;
+        notified.await;
     }
 }
 

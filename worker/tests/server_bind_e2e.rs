@@ -40,3 +40,27 @@ async fn stale_socket_file_is_replaced() {
     );
     let _ = std::fs::remove_file(&socket);
 }
+
+/// 旧 worker 排干退出时只能删除自己创建的 socket 文件：drain 期间新 worker 可能已经
+/// 在同一路径重新 bind，误删会让新 worker 不可达并被重复拉起。
+#[tokio::test]
+async fn exiting_worker_only_removes_its_own_socket_file() {
+    let socket = temp_socket("owned");
+    let _ = std::fs::remove_file(&socket);
+    let old = hi_kafka_worker::Server::bind(&socket).await.unwrap();
+    let old_identity = old.socket_identity();
+    drop(old); // 旧 worker 停止监听（drain 中）
+
+    let replacement = hi_kafka_worker::Server::bind(&socket).await.unwrap();
+    assert!(!hi_kafka_worker::server::remove_socket_if_owned(
+        &socket,
+        old_identity
+    ));
+    assert!(socket.exists(), "replacement worker's socket must survive");
+
+    assert!(hi_kafka_worker::server::remove_socket_if_owned(
+        &socket,
+        replacement.socket_identity()
+    ));
+    assert!(!socket.exists());
+}
