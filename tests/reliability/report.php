@@ -20,6 +20,10 @@ declare(strict_types=1);
 
 require __DIR__ . '/lib.php';
 
+// 账本时间戳全部载入内存做二分查找：内存随 soak 时长线性增长（2h / 200 msg/s 约
+// 280 万个时间戳，超过 php -n 默认的 128M）。离线工具，不设上限。
+ini_set('memory_limit', '-1');
+
 $options = parse_options($argv);
 $dir = opt($options, 'dir');
 $limits = [
