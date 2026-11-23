@@ -1,8 +1,8 @@
 # 多阶段 Linux 构建：基于官方 php-cli 镜像（Debian bookworm），输出 hi_kafka.so。
 #
 # 用法（默认走 USTC 镜像加速 apt / rustup / crates.io）：
-#   docker build --build-arg PHP_VERSION=8.3 -t hi-kafka:php8.3 .
-#   docker run --rm hi-kafka:php8.3 php -m | grep hi
+#   docker build --build-arg PHP_VERSION=8.2 -t hi-kafka:php8.2 .
+#   docker run --rm hi-kafka:php8.2 php -m | grep hi
 #
 # 关掉镜像走官方源（境外环境）：
 #   docker build \
@@ -10,11 +10,11 @@
 #       --build-arg RUSTUP_DIST_SERVER=https://static.rust-lang.org \
 #       --build-arg RUSTUP_UPDATE_ROOT=https://static.rust-lang.org/rustup \
 #       --build-arg CRATES_INDEX= \
-#       -t hi-kafka:php8.3 .
+#       -t hi-kafka:php8.2 .
 #
 # 跨架构（在 colima/Docker Desktop 上启 buildx）：
 #   docker buildx build --platform linux/amd64,linux/arm64 \
-#       --build-arg PHP_VERSION=8.3 -t hi-kafka:php8.3 .
+#       --build-arg PHP_VERSION=8.2 -t hi-kafka:php8.2 .
 #
 # 产物路径：
 #   /usr/lib/php/extensions/hi_kafka.so
@@ -27,13 +27,13 @@
 #   - 仅 libsasl2 / libz 用系统包（ABI 稳，几十年不变）
 #   - 同一 commit 在 Debian / Alpine / macOS 出的 .so 字节行为一致
 
-ARG PHP_VERSION=8.3
-ARG RUST_VERSION=1.85
-# Debian 发行版 codename：pin 在 bookworm（Debian 12 / LLVM 14）。
-# 不 pin 的话，`php:8.3-cli` 现在已经 follow trixie（Debian 13 / LLVM 19），
-# 而 rdkafka-sys 4.10 用的 bindgen 0.68 不识别 LLVM 19+，会撞「Dynamic loading not supported」。
-# 升级 bindgen 需要 rdkafka 上游跟进，目前 pin Debian 是稳态。
-# 升 bookworm → trixie checklist 同 Dockerfile.alpine 的 ALPINE_VARIANT 升级说明。
+# 与 Dockerfile.alpine 对齐：PHP 8.2、stable 工具链（与 rust-toolchain.toml 一致，
+# 避免装两套工具链）。
+ARG PHP_VERSION=8.2
+ARG RUST_VERSION=stable
+# Debian 发行版 codename：pin 在 bookworm（Debian 12 / glibc 2.36 / LLVM 14）。
+# 产物依赖构建镜像的 glibc 版本，只能在 glibc ≥ 构建版本的系统上加载；pin 住发行版
+# 让产物的最低 glibc 要求固定。升级 checklist 同 Dockerfile.alpine 的 ALPINE_VARIANT 说明。
 ARG DEBIAN_CODENAME=bookworm
 
 # 国内镜像加速（USTC）。设为空字符串则走默认源。
@@ -84,10 +84,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libclang-dev \
         clang \
         pkg-config \
+        binutils \
         curl \
         git \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# bindgen 需要 LIBCLANG_PATH；按实际安装的 llvm 版本探测（与 Dockerfile.alpine 相同）。
+RUN printf '#!/bin/sh\nlib=$(ls /usr/lib/llvm*/lib/libclang.so* 2>/dev/null | tail -1)\n[ -n "$lib" ] || { echo "libclang not found" >&2; exit 1; }\nexport LIBCLANG_PATH=$(dirname "$lib")\nexec "$@"\n' > /usr/local/bin/with-libclang \
+    && chmod +x /usr/local/bin/with-libclang
 
 # Rust 工具链。RUSTUP_DIST_SERVER / RUSTUP_UPDATE_ROOT 让 rustup 从 USTC 拉。
 ENV RUSTUP_HOME=/usr/local/rustup \
@@ -120,7 +125,7 @@ RUN mkdir -p proto/src worker/src ext/src \
     && echo 'pub fn _stub() {}' > worker/src/lib.rs \
     && echo 'fn main() {}' > worker/src/main.rs \
     && echo 'pub fn _stub() {}' > ext/src/lib.rs \
-    && cargo build --workspace --release --features hi-kafka-worker/kafka-vendored-tls 2>/dev/null || true
+    && with-libclang cargo build --workspace --release --features hi-kafka-worker/kafka-vendored-tls 2>/dev/null || true
 
 # 真实源码
 COPY proto ./proto
@@ -128,12 +133,10 @@ COPY worker ./worker
 COPY ext ./ext
 
 RUN touch proto/src/lib.rs worker/src/lib.rs worker/src/main.rs ext/src/lib.rs \
-    && cargo build -p hi-kafka --release --features kafka-vendored-tls
+    && with-libclang cargo build -p hi-kafka --release --features kafka-vendored-tls
 
 # 稳态校验：.so 不应当 NEEDED librdkafka / libssl / libcrypto（全部 vendored 进来）
-RUN apt-get update && apt-get install -y --no-install-recommends binutils \
-    && rm -rf /var/lib/apt/lists/* \
-    && echo "==> readelf NEEDED:" \
+RUN echo "==> readelf NEEDED:" \
     && readelf -d /src/target/release/libhi_kafka.so | grep NEEDED \
     && ! (readelf -d /src/target/release/libhi_kafka.so | grep -E "NEEDED.*(librdkafka|libssl|libcrypto)") \
     && echo "==> ✓ no librdkafka/libssl/libcrypto runtime dependency"

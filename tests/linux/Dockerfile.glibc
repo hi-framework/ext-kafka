@@ -1,0 +1,45 @@
+# Linux 验证镜像（glibc 变体）：Debian bookworm / glibc 2.36 / PHP 8.2 + Swoole，
+# 加上 e2e 与 soak 需要的工具。扩展来自根目录 Dockerfile 的 builder 阶段。
+# 与 tests/linux/Dockerfile（musl）一一对应，由 tests/linux/run.sh 以 LIBC=glibc 选用。
+
+ARG BUILDER=localhost/hi-kafka-builder:amd64-glibc
+ARG PHP_VERSION=8.2
+ARG DEBIAN_CODENAME=bookworm
+# 与生产一致：Swoole 4.8（4.8.13 是该系列支持 PHP 8.2 的最终版本）。
+ARG SWOOLE_VERSION=4.8.13
+# soak 通过 docker CLI 注入 broker 故障。bookworm 只有带 daemon 的 docker.io 包，
+# 这里直接取官方镜像中的静态 CLI。
+ARG DOCKER_CLI_IMAGE=docker.io/library/docker:27.5.1-cli
+ARG RUNTIME_IMAGE=php:${PHP_VERSION}-cli-${DEBIAN_CODENAME}
+
+FROM ${BUILDER} AS builder
+FROM ${DOCKER_CLI_IMAGE} AS docker-cli
+
+FROM ${RUNTIME_IMAGE}
+ARG SWOOLE_VERSION
+ARG APT_MIRROR=mirrors.ustc.edu.cn
+
+RUN if [ -n "${APT_MIRROR}" ]; then \
+        find /etc/apt -type f \( -name '*.sources' -o -name 'sources.list' \) \
+            -exec sed -i \
+                -e "s|deb.debian.org|${APT_MIRROR}|g" \
+                -e "s|security.debian.org/debian-security|${APT_MIRROR}/debian-security|g" \
+                -e "s|security.debian.org|${APT_MIRROR}/debian-security|g" \
+                {} +; \
+    fi \
+    && apt-get update \
+    # 与根目录 Dockerfile runtime 阶段相同的运行时依赖
+    && apt-get install -y --no-install-recommends libsasl2-2 zlib1g libcurl4 ca-certificates \
+    # 测试工具：ps、lsof、ss
+    && apt-get install -y --no-install-recommends procps lsof iproute2 \
+    && apt-get install -y --no-install-recommends $PHPIZE_DEPS \
+    && (php -m | grep -q '^pcntl$' || docker-php-ext-install pcntl) \
+    # 显式给出全部 configure 选项，不依赖交互默认值（默认开启的 brotli 需要额外依赖）
+    && pecl install -D 'enable-sockets="no" enable-openssl="no" enable-mysqlnd="no" enable-swoole-curl="no" enable-cares="no" enable-brotli="no" enable-swoole-pgsql="no" with-swoole-odbc="no" with-swoole-oracle="no" enable-swoole-sqlite="no"' swoole-${SWOOLE_VERSION} \
+    && rm -rf /var/lib/apt/lists/* /tmp/pear
+
+COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
+COPY --from=builder /src/target/release/libhi_kafka.so /opt/hi-kafka/libhi_kafka.so
+
+WORKDIR /src
+CMD ["php", "-v"]

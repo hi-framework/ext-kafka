@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 在 Linux（Alpine/musl）容器中运行全部验证。宿主只需要 docker 或 podman，以及一个
+# 在 Linux 容器中运行全部验证：默认 Alpine/musl（与生产一致），LIBC=glibc 时用
+# Debian bookworm/glibc。宿主只需要 docker 或 podman，以及一个
 # 运行中的 broker 容器（默认 hi-kafka-test，EXTERNAL 监听 127.0.0.1:9094）。
 # 必须在与目标架构相同的机器上原生运行，不要用跨架构模拟。
 #
@@ -8,9 +9,10 @@
 #   tests/linux/run.sh rust php e2e                # 运行指定套件
 #   SOAK_DURATION=3600 tests/linux/run.sh soak
 #   CONTAINER_CLI=podman CONTAINER_SOCKET=/run/user/$(id -u)/podman/podman.sock tests/linux/run.sh ...
+#   LIBC=glibc tests/linux/run.sh build rust php e2e
 #
-# 环境变量：ARCH（默认取宿主架构）、BUILD_ARGS（透传给 Dockerfile.alpine，例如
-# --build-arg RUNTIME_IMAGE=...）、RESULTS（soak 报告目录）。
+# 环境变量：ARCH（默认取宿主架构）、LIBC（musl | glibc，默认 musl）、BUILD_ARGS
+# （透传给构建，例如 --build-arg RUNTIME_IMAGE=...）、RESULTS（soak 报告目录）。
 #
 # 套件：
 #   rust  builder 镜像内 cargo test（Linux 专属路径：close_range、/proc 线程数等）
@@ -26,9 +28,17 @@ CLI="${CONTAINER_CLI:-docker}"
 SOCKET="${CONTAINER_SOCKET:-/var/run/docker.sock}"
 BUILD_ARGS="${BUILD_ARGS:-}"
 PLATFORM="linux/${ARCH}"
+LIBC="${LIBC:-musl}"
+case "$LIBC" in
+    musl) BUILD_DOCKERFILE=Dockerfile.alpine; TEST_DOCKERFILE=tests/linux/Dockerfile; TAG="$ARCH"; TEST_RUSTFLAGS="" ;;
+    # ext 的单测二进制引用只有 PHP 进程才提供的符号；glibc 上 rustc 默认 full RELRO
+    # （-z now）要求加载时解析全部符号，测试二进制会直接退出。仅测试构建改为 partial。
+    glibc) BUILD_DOCKERFILE=Dockerfile; TEST_DOCKERFILE=tests/linux/Dockerfile.glibc; TAG="$ARCH-glibc"; TEST_RUSTFLAGS="-C relro-level=partial" ;;
+    *) echo "unknown LIBC $LIBC (musl | glibc)" >&2; exit 2 ;;
+esac
 # localhost/ 前缀：podman 不解析无 registry 的短名，docker 也接受这种本地 tag。
-BUILDER="localhost/hi-kafka-builder:${ARCH}"
-IMAGE="localhost/hi-kafka-test:${ARCH}"
+BUILDER="localhost/hi-kafka-builder:${TAG}"
+IMAGE="localhost/hi-kafka-test:${TAG}"
 RESULTS="${RESULTS:-$HOME/hi-kafka-linux-results}"
 KAFKA_CONTAINER="${KAFKA_CONTAINER:-hi-kafka-test}"
 mkdir -p "$RESULTS"
@@ -48,20 +58,28 @@ PHP_BASE="-d extension=pcntl"
 EXT=/opt/hi-kafka/libhi_kafka.so
 
 for suite in "$@"; do
-    echo "===================== [$ARCH] $suite ====================="
+    echo "===================== [$ARCH/$LIBC] $suite ====================="
     case "$suite" in
         build)
             # shellcheck disable=SC2086
-            "$CLI" build --platform "$PLATFORM" -f Dockerfile.alpine --target builder $BUILD_ARGS -t "$BUILDER" .
+            "$CLI" build --platform "$PLATFORM" -f "$BUILD_DOCKERFILE" --target builder $BUILD_ARGS -t "$BUILDER" .
             # shellcheck disable=SC2086
-            "$CLI" build --platform "$PLATFORM" -f tests/linux/Dockerfile --build-arg "BUILDER=$BUILDER" $BUILD_ARGS -t "$IMAGE" .
+            "$CLI" build --platform "$PLATFORM" -f "$TEST_DOCKERFILE" --build-arg "BUILDER=$BUILDER" $BUILD_ARGS -t "$IMAGE" .
             ;;
         rust)
             # builder 镜像里是构建时拷入的源码；挂载当前源码到 /work 运行，target 放在
-            # 容器内，避免与宿主（macOS）产物混用。
-            "$CLI" run --rm --platform "$PLATFORM" --network host -v "$PWD:/work:ro" "$BUILDER" sh -c '
+            # 容器内，避免与宿主（macOS）产物混用。输出先落盘再过滤，退出码取 cargo 的。
+            # 不能传空的 RUSTFLAGS：会覆盖 Alpine builder 镜像中必需的 -crt-static 设置。
+            rust_env=()
+            [[ -n "$TEST_RUSTFLAGS" ]] && rust_env=(-e "RUSTFLAGS=$TEST_RUSTFLAGS")
+            "$CLI" run --rm --platform "$PLATFORM" --network host "${rust_env[@]}" \
+                -v "$PWD:/work:ro" "$BUILDER" sh -c '
                 rm -rf /tmp/w && mkdir /tmp/w && cd /work && tar --exclude=./target --exclude=./php-driver/vendor -cf - . | tar -xf - -C /tmp/w
-                cd /tmp/w && CARGO_TARGET_DIR=/src/target with-libclang cargo test --workspace --features hi-kafka-worker/kafka-vendored-tls 2>&1 | grep -E "test result|FAILED|panicked|^error|warning: unused" '
+                cd /tmp/w && CARGO_TARGET_DIR=/src/target with-libclang cargo test --workspace --features hi-kafka-worker/kafka-vendored-tls > /tmp/cargo-test.log 2>&1
+                status=$?
+                grep -E "test result|FAILED|panicked|^error" /tmp/cargo-test.log
+                [ $status -eq 0 ] || tail -40 /tmp/cargo-test.log
+                exit $status '
             ;;
         php)
             run_in "$IMAGE" sh -c "cd php-driver && php -n $PHP_BASE -d extension=$EXT vendor/bin/phpunit tests"
@@ -73,7 +91,7 @@ for suite in "$@"; do
                 ./scripts/run-all-e2e.sh
             ;;
         soak)
-            out="/results/soak-${ARCH}-$(date +%Y%m%d-%H%M%S)"
+            out="/results/soak-${TAG}-$(date +%Y%m%d-%H%M%S)"
             run_in "$IMAGE" php -n $PHP_BASE tests/reliability/soak.php \
                 --out="$out" --ext=$EXT --runtime=swoole \
                 --php-args="$PHP_BASE -d extension=swoole" \
