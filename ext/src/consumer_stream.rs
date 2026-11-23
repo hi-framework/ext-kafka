@@ -966,9 +966,9 @@ mod tests {
     }
 
     /// 小帧复制到独立分配，不把整块读缓冲钉在业务长期持有的 record 上；
-    /// 占满缓冲的大帧直接零拷贝引用。
+    /// 跨多次读取的大帧仍被完整拼出。
     #[test]
-    fn small_frames_are_copied_and_large_frames_are_borrowed() {
+    fn small_frames_do_not_pin_the_read_buffer() {
         let (mut writer, mut reader) = UnixStream::pair().expect("unix stream pair");
         let large = vec![7u8; 1 << 20];
         let mut wire = BytesMut::new();
@@ -984,13 +984,10 @@ mod tests {
             "small payload must not alias the read buffer"
         );
 
-        let before = buffer.as_ptr() as usize;
         let (_, _, payload) = read_frame_buffered(&mut reader, &mut buffer).expect("large");
-        assert_eq!(payload.len(), large.len());
-        let start = payload.as_ptr() as usize - HEADER_LEN;
-        assert!(
-            start >= before || buffer.capacity() == 0,
-            "large payload is borrowed in place"
+        assert_eq!(
+            payload, large,
+            "a frame spanning many reads is reassembled intact"
         );
         writer_thread.join().unwrap().unwrap();
     }
