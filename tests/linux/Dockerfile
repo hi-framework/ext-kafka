@@ -28,7 +28,7 @@ RUN if [ -n "${APK_MIRROR}" ]; then \
     # 与 Dockerfile.alpine runtime 阶段相同的运行时依赖
     && apk add --no-cache libsasl zlib libcurl libgcc libstdc++ ca-certificates \
     # 测试工具：完整 ps（busybox ps 不支持 -o/-p）、lsof、bash、docker CLI
-    && apk add --no-cache bash procps lsof docker-cli \
+    && apk add --no-cache bash procps lsof iproute2 docker-cli \
     && apk add --no-cache --virtual .build-deps $PHPIZE_DEPS linux-headers \
     && (php -m | grep -q '^pcntl$' || docker-php-ext-install pcntl) \
     # 显式给出全部 configure 选项，不依赖交互默认值（默认开启的 brotli 需要额外依赖）

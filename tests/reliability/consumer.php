@@ -37,7 +37,7 @@ pcntl_signal(SIGINT, static function () use (&$stop): void {
 
 run_in_runtime($runtime, static function () use ($socket, $topic, $run, $id, $group, $dir, $commitEvery, $runtime, $brokers, &$stop): void {
     $client = create_client($runtime, $socket);
-    $client->registerCluster('default', ['bootstrap.servers' => $brokers]);
+    $client->registerCluster('default', cluster_config($brokers));
     $ledger = open_ledger("{$dir}/consumed-{$id}.log");
     log_event($dir, ['type' => 'consumer_start', 'id' => $id, 'pid' => getmypid()]);
 

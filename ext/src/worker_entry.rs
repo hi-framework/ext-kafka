@@ -200,7 +200,7 @@ async fn run_server(config: ChildConfig) -> anyhow::Result<()> {
     }
 
     // drain 期间可能已有新 worker 在同一路径 bind：只删除自己的 socket 与 pid 文件。
-    server::remove_socket_if_owned(&config.socket, socket_identity);
+    server::remove_socket_if_owned(&config.socket, &socket_identity);
     remove_pid_file_if_owned(&pid_file);
     info!("hi-kafka worker (embedded) stopped");
     Ok(())

@@ -18,6 +18,12 @@ use tokio::sync::RwLock;
 
 pub type ClusterConfig = HashMap<String, String>;
 
+/// worker 为每个 librdkafka 客户端（producer 与 consumer）设置的默认值；业务在集群
+/// 配置中显式设置同名键时以业务为准。
+///
+/// `statistics.interval.ms`：驱动 broker 列表兜底（见 `broker_watchdog`）。
+pub const CLIENT_DEFAULTS: &[(&str, &str)] = &[("statistics.interval.ms", "5000")];
+
 /// 单个集群存储的 OAuth token 完整描述。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredOAuthToken {

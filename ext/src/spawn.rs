@@ -99,7 +99,7 @@ pub fn worker_alive(socket: &Path) -> bool {
 
 /// 直连 socket 并完成 HELLO 握手（RPC 角色）。任一步失败返回 `None`。
 pub fn handshake(socket: &Path, timeout: Duration) -> Option<UnixStream> {
-    let mut stream = UnixStream::connect(socket).ok()?;
+    let mut stream = crate::uds::connect(socket, timeout).ok()?;
     stream.set_read_timeout(Some(timeout)).ok()?;
     stream.set_write_timeout(Some(timeout)).ok()?;
 

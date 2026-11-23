@@ -26,6 +26,7 @@ mod lifecycle;
 mod pool;
 mod protocol;
 mod spawn;
+mod uds;
 mod worker_entry;
 mod worker_health;
 

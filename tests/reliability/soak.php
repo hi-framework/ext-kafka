@@ -62,6 +62,36 @@ $docker = static function (array $args, bool $wait = true) use ($dockerEnv): voi
         proc_close($process);
     }
 };
+$brokerState = static function () use ($dockerEnv, $params): string {
+    $process = proc_open(['docker', 'inspect', '-f', '{{.State.Status}}', $params['kafka_container']], [1 => ['pipe', 'w'], 2 => ['file', '/dev/null', 'w']], $pipes, null, getenv() + $dockerEnv);
+    $state = trim((string) stream_get_contents($pipes[1]));
+    proc_close($process);
+    return $state;
+};
+/**
+ * 确保 broker 容器处于运行状态；做不到时中止 soak。
+ *
+ * rootless podman（pasta 端口转发）上 restart 会因旧端口尚未释放而失败、容器停在
+ * exited；若不检查，broker 永久缺失会被误记为「组件未恢复」。
+ */
+$ensureBrokerRunning = static function () use ($docker, $brokerState, $out, $params): int {
+    $deadline = microtime(true) + 60;
+    for ($attempt = 1; microtime(true) < $deadline; ++$attempt) {
+        $state = $brokerState();
+        if ('running' === $state) {
+            return $attempt;
+        }
+        if ('paused' === $state) {
+            $docker(['unpause', $params['kafka_container']]);
+        } else {
+            $docker(['start', $params['kafka_container']]);
+        }
+        usleep(1_000_000);
+    }
+    log_event($out, ['type' => 'injection_error', 'message' => 'broker container could not be started']);
+    fwrite(STDERR, "ABORT: broker container could not be started; fault injection environment is broken\n");
+    exit(3);
+};
 // bitnami 镜像把 kafka-topics.sh 放在 PATH 上，apache/kafka 镜像在 /opt/kafka/bin。
 $kafkaTopics = static fn (array $args) => $docker(['exec', $params['kafka_container'], 'sh', '-c',
     'PATH="$PATH:/opt/kafka/bin:/opt/bitnami/kafka/bin" kafka-topics.sh --bootstrap-server 127.0.0.1:9092 ' . implode(' ', array_map('escapeshellarg', $args))]);
@@ -118,7 +148,7 @@ $activeFault = null;
 $recordFault = static function (array $fault) use ($out): void {
     file_put_contents("{$out}/faults.jsonl", json_encode($fault, JSON_UNESCAPED_SLASHES) . "\n", FILE_APPEND);
 };
-$inject = static function (string $name) use (&$procs, $workerPid, $docker, $params, &$activeFault, $recordFault): void {
+$inject = static function (string $name) use (&$procs, $workerPid, $docker, $params, &$activeFault, $recordFault, $ensureBrokerRunning): void {
     $now = microtime(true);
     $fault = ['fault' => $name, 'start' => $now, 'end' => $now];
     switch ($name) {
@@ -146,13 +176,18 @@ $inject = static function (string $name) use (&$procs, $workerPid, $docker, $par
             posix_kill($procs[$victim]['pid'], SIGKILL);
             break;
         case 'broker-restart':
-            $docker(['restart', $params['kafka_container']]);
+            // stop + start，而不是 restart：后者在 rootless podman 上可能只停不启。
+            $docker(['stop', '-t', '5', $params['kafka_container']]);
+            $fault['start_attempts'] = $ensureBrokerRunning();
             $fault['end'] = microtime(true);
             break;
         case 'broker-pause':
             $docker(['pause', $params['kafka_container']]);
             $fault['until'] = $now + 15;
-            $fault['recover'] = static fn () => $docker(['unpause', $params['kafka_container']]);
+            $fault['recover'] = static function () use ($docker, $params, $ensureBrokerRunning): void {
+                $docker(['unpause', $params['kafka_container']]);
+                $ensureBrokerRunning();
+            };
             break;
         default:
             throw new InvalidArgumentException("unknown fault {$name}");
@@ -234,6 +269,35 @@ $sample = static function (string $phase) use ($out, $workerPid, $rss, $fds, $me
     file_put_contents("{$out}/samples.jsonl", json_encode($row, JSON_UNESCAPED_SLASHES) . "\n", FILE_APPEND);
 };
 
+// ---------------------------------------------------------------- stall capture
+/**
+ * 负载中 ack 长时间无进展时采集现场：每个进程（含 worker 各线程）阻塞在哪个系统调用，
+ * 以及 worker 监听 socket 的队列。仅 Linux 有 /proc 细节；每次卡死只采集一次。
+ */
+$captureStall = static function (float $since) use ($out, &$procs, $workerPid, $socket): void {
+    $lines = [sprintf('stall: no ack progress for %.0fs at %s', microtime(true) - $since, date('c'))];
+    $describe = static function (string $label, int $pid) use (&$lines): void {
+        if ($pid <= 0 || ! is_dir("/proc/{$pid}")) {
+            $lines[] = "{$label} pid={$pid}: not running";
+            return;
+        }
+        foreach (glob("/proc/{$pid}/task/*") ?: ["/proc/{$pid}"] as $task) {
+            $state = preg_match('/^State:\s+(.*)$/m', (string) @file_get_contents("{$task}/status"), $m) ? $m[1] : '?';
+            $lines[] = sprintf('%s pid=%d tid=%s state=%s wchan=%s syscall=%s', $label, $pid, basename($task), $state,
+                trim((string) @file_get_contents("{$task}/wchan")), trim((string) @file_get_contents("{$task}/syscall")));
+        }
+    };
+    foreach ($procs as $name => $info) {
+        $describe($name, $info['pid']);
+    }
+    $describe('worker', $workerPid());
+    $lines[] = 'unix sockets (ss -xlp / listen queue):';
+    $lines[] = (string) shell_exec('ss -xl 2>/dev/null | grep -F ' . escapeshellarg($socket));
+    $lines[] = (string) shell_exec('ss -x 2>/dev/null | grep -cF ' . escapeshellarg($socket)) . ' connections on worker socket';
+    file_put_contents("{$out}/stall-" . date('His') . '.txt', implode("\n", $lines) . "\n");
+    log_event($out, ['type' => 'stall_captured', 'since' => $since]);
+};
+
 // ---------------------------------------------------------------- main loop
 $stopRequested = false;
 pcntl_async_signals(true);
@@ -245,22 +309,44 @@ $start = microtime(true);
 $nextSample = $start;
 $nextFault = $start + $params['warmup'] + $params['fault_interval'];
 $faultCount = 0;
+$lastAcked = -1;
+$lastAckProgress = $start;
+$lastFaultEnd = $start;
+$stallCaptured = false;
 fwrite(STDERR, "soak {$run}: duration={$params['duration']}s faults=" . implode(',', $params['faults']) . " out={$out}\n");
 while (! $stopRequested && microtime(true) - $start < $params['duration']) {
     $supervise(false);
-    $tickFault();
+    if (null !== $activeFault) {
+        $tickFault();
+        if (null === $activeFault) {
+            $lastFaultEnd = microtime(true);
+        }
+    }
     $now = microtime(true);
     if ($now >= $nextSample) {
         $sample($now - $start < $params['warmup'] ? 'warmup' : 'load');
         $nextSample += $params['sample_interval'];
+        $ackedNow = $countLines("{$out}/acked-*.log");
+        if ($ackedNow !== $lastAcked) {
+            $lastAcked = $ackedNow;
+            $lastAckProgress = $now;
+            $stallCaptured = false;
+        } elseif (! $stallCaptured && null === $activeFault && $now - $lastAckProgress > 20 && $now - $lastFaultEnd > 20) {
+            $captureStall($lastAckProgress);
+            $stallCaptured = true;
+        }
     }
-    if ([] !== $params['faults'] && null === $activeFault && $now >= $nextFault) {
+    // 负载结束前 60s 内不再注入：故障（最长 15s）结束后需要留出观察恢复的时间，否则
+    // 生产者停止后不再有 ack，会被误判为「未恢复」。
+    $loadRemaining = $params['duration'] - ($now - $start);
+    if ([] !== $params['faults'] && null === $activeFault && $now >= $nextFault && $loadRemaining > 60) {
         $name = 'random' === $params['fault_order']
             ? $params['faults'][mt_rand(0, count($params['faults']) - 1)]
             : $params['faults'][$faultCount % count($params['faults'])];
         ++$faultCount;
         fwrite(STDERR, sprintf("[%5.0fs] inject %s\n", $now - $start, $name));
         $inject($name);
+        $lastFaultEnd = microtime(true);
         $nextFault = microtime(true) + $params['fault_interval'];
     }
     usleep(200_000);

@@ -79,12 +79,20 @@ $firstAfter = static function (array $sorted, float $t): ?float {
 };
 
 // ---------------------------------------------------------------- recovery
+// 负载结束时间取计划值，不能取最后一个 ack：真正卡死时最后一个 ack 就停在故障时刻，
+// 用它做边界会把卡死的故障误标为「无法判定」。
+$loadEnd = (float) $params['started_at'] + (float) $params['duration'];
 $recoveries = [];
 foreach ($faults as $fault) {
     if (isset($fault['skipped'])) {
         continue;
     }
     $end = (float) $fault['end'];
+    // 故障结束距负载结束不足观察窗口：恢复与否无法判定（生产者已停止，不再有新 ack）。
+    if ($end + $limits['max_recovery'] > $loadEnd) {
+        $recoveries[] = ['fault' => $fault['fault'], 'at' => round($fault['start'] - $params['started_at'], 1), 'duration' => round($end - $fault['start'], 1), 'produce_recovery' => 'N/A', 'consume_recovery' => 'N/A'];
+        continue;
+    }
     $produce = $firstAfter($ackTs, $end);
     $consume = $firstAfter($consumeTs, $end);
     $recoveries[] = [
@@ -99,6 +107,9 @@ $maxRecovery = 0.0;
 $unrecovered = 0;
 foreach ($recoveries as $r) {
     foreach (['produce_recovery', 'consume_recovery'] as $key) {
+        if ('N/A' === $r[$key]) {
+            continue;
+        }
         if (null === $r[$key]) {
             ++$unrecovered;
         } else {
@@ -117,7 +128,6 @@ $inFaultWindow = static function (float $a, float $b) use ($windows): bool {
     }
     return false;
 };
-$loadEnd = $ackTs === [] ? 0.0 : end($ackTs);
 $maxStall = 0.0;
 $stallAt = null;
 for ($i = 1, $n = count($consumeTs); $i < $n; ++$i) {
@@ -172,7 +182,8 @@ if (null !== $longest && count($longest['rows']) >= 3) {
 // 进程自己退出（非零退出码）或被 SIGKILL 以外的信号终止，都意味着客户端没能在故障中
 // 自愈，只能依赖进程管理器重启。consumer-kill 注入的 SIGKILL 是预期内的。
 $crashes = array_values(array_filter($events, static fn ($e) => 'process_exit' === ($e['type'] ?? null)
-    && ! ($e['signaled'] && SIGKILL === $e['termsig'])
+    // 9 = SIGKILL；报告由 php -n 运行，不能依赖 pcntl 提供的信号常量。
+    && ! ($e['signaled'] && 9 === $e['termsig'])
     && 0 !== $e['exitcode']));
 
 // ---------------------------------------------------------------- verdict
@@ -229,7 +240,8 @@ $md[] = '';
 $md[] = '| 故障 | 注入时刻 | 持续 | 生产恢复 | 消费恢复 |';
 $md[] = '| --- | ---: | ---: | ---: | ---: |';
 foreach ($recoveries as $r) {
-    $md[] = "| {$r['fault']} | {$r['at']}s | {$r['duration']}s | " . ($r['produce_recovery'] ?? '未恢复') . 's | ' . ($r['consume_recovery'] ?? '未恢复') . 's |';
+    $cell = static fn ($v) => null === $v ? '未恢复' : ('N/A' === $v ? 'N/A（负载已结束）' : "{$v}s");
+    $md[] = "| {$r['fault']} | {$r['at']}s | {$r['duration']}s | " . $cell($r['produce_recovery']) . ' | ' . $cell($r['consume_recovery']) . ' |';
 }
 $md[] = '';
 $md[] = '进程重启：' . json_encode($restarts) . '；错误分布：' . json_encode($errorKinds, JSON_UNESCAPED_SLASHES);

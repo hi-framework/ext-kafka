@@ -38,6 +38,8 @@ pub enum PoolError {
 }
 
 const DEFAULT_MAX_IDLE: usize = 16;
+/// 建链上限：worker 冻结时监听队列会被占满，无超时的 connect 会让 PHP 进程永久挂起。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub struct ConnectionPool {
     socket: PathBuf,
@@ -116,10 +118,11 @@ impl ConnectionPool {
 
         // 池空 → 新建
         self.stats.lock().unwrap().misses_total += 1;
-        let mut stream = UnixStream::connect(&self.socket).map_err(|e| PoolError::Connect {
-            socket: self.socket.display().to_string(),
-            source: e,
-        })?;
+        let mut stream =
+            crate::uds::connect(&self.socket, CONNECT_TIMEOUT).map_err(|e| PoolError::Connect {
+                socket: self.socket.display().to_string(),
+                source: e,
+            })?;
         // F: 同步握手——双端 PROTOCOL_MAJOR 不一致就拒绝连接，
         // 避免字段错位静默解码出垃圾值
         if let Err(reason) = handshake(&mut stream) {

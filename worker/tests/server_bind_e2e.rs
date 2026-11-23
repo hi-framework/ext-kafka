@@ -54,13 +54,13 @@ async fn exiting_worker_only_removes_its_own_socket_file() {
     let replacement = hi_kafka_worker::Server::bind(&socket).await.unwrap();
     assert!(!hi_kafka_worker::server::remove_socket_if_owned(
         &socket,
-        old_identity
+        &old_identity
     ));
     assert!(socket.exists(), "replacement worker's socket must survive");
 
     assert!(hi_kafka_worker::server::remove_socket_if_owned(
         &socket,
-        replacement.socket_identity()
+        &replacement.socket_identity()
     ));
     assert!(!socket.exists());
 }

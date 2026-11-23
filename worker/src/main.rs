@@ -119,7 +119,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // drain 期间可能已有新 worker 在同一路径 bind，只删除自己的 socket 文件。
-    if !server::remove_socket_if_owned(&cli.socket, socket_identity) {
+    if !server::remove_socket_if_owned(&cli.socket, &socket_identity) {
         info!(path = %cli.socket.display(), "socket file no longer ours; leaving it in place");
     }
 

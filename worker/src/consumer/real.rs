@@ -2,6 +2,7 @@ use super::{
     ConsumerError, ConsumerSource, ConsumerSourceFactory, GlobalBudget, SourceNotice, SourceRead,
     SourceRecord,
 };
+use crate::broker_watchdog::BrokerWatchdog;
 use crate::cluster::{ClusterRegistryHandle, OAuthTokenSlot};
 use crate::error::WorkerError;
 use crate::watermark::PartitionKey;
@@ -16,6 +17,7 @@ use rdkafka::consumer::{
 };
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::message::{Headers, Message};
+use rdkafka::statistics::Statistics;
 use rdkafka::topic_partition_list::TopicPartitionList;
 use rdkafka::{ClientConfig, Offset};
 use std::sync::{Arc, Mutex};
@@ -44,10 +46,15 @@ struct KafkaContext {
     notice_signal: Arc<tokio::sync::Notify>,
     oauth: OAuthTokenSlot,
     cluster: String,
+    watchdog: Arc<BrokerWatchdog>,
 }
 
 impl ClientContext for KafkaContext {
     const ENABLE_REFRESH_OAUTH_TOKEN: bool = true;
+
+    fn stats(&self, statistics: Statistics) {
+        self.watchdog.observe(&statistics);
+    }
     fn generate_oauth_token(
         &self,
         _config: Option<&str>,
@@ -150,18 +157,15 @@ impl ConsumerSourceFactory for KafkaSourceFactory {
             .ok_or_else(|| ConsumerError::ClusterNotRegistered(request.cluster.clone()))?;
         let notices = Arc::new(Mutex::new(Vec::new()));
         let notice_signal = Arc::new(tokio::sync::Notify::new());
-        let context = KafkaContext {
-            notices: notices.clone(),
-            notice_signal: notice_signal.clone(),
-            oauth,
-            cluster: request.cluster.clone(),
-        };
         let mut config = ClientConfig::new();
         // 可调的默认值：本地预取队列的内存上界由下面强制的 queued.max.messages.kbytes
         // 保证，这里只决定流水线深度。
         config
             .set("queued.min.messages", DEFAULT_QUEUED_MIN_MESSAGES)
             .set("fetch.queue.backoff.ms", "10");
+        for (key, value) in crate::cluster::CLIENT_DEFAULTS {
+            config.set(*key, *value);
+        }
         for (key, value) in cluster_config {
             config.set(key, value);
         }
@@ -184,9 +188,18 @@ impl ConsumerSourceFactory for KafkaSourceFactory {
         if !request.client_id.is_empty() {
             config.set("client.id", &request.client_id);
         }
+        let watchdog = Arc::new(BrokerWatchdog::new(config.get("bootstrap.servers")));
+        let context = KafkaContext {
+            notices: notices.clone(),
+            notice_signal: notice_signal.clone(),
+            oauth,
+            cluster: request.cluster.clone(),
+            watchdog: watchdog.clone(),
+        };
         let consumer: StreamConsumer<KafkaContext> = config
             .create_with_context(context)
             .map_err(|e| ConsumerError::Backend(anyhow::anyhow!(e)))?;
+        watchdog.attach(consumer.client().native_ptr());
         consumer
             .subscribe(
                 &request

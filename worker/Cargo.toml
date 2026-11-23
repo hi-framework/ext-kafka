@@ -49,3 +49,7 @@ getrandom = "0.3"
 # 给 #9 panic guard 用的 `FutureExt::catch_unwind`；std 只有 sync 版的 catch_unwind
 futures = { version = "0.3", default-features = false, features = ["std"] }
 rdkafka = { version = "0.38", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# O_PATH fd 钉住 socket 文件的 inode（server::SocketIdentity）
+libc = "0.2"

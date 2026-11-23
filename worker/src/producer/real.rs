@@ -1,5 +1,6 @@
 //! 真实 rdkafka 生产者。仅在 `kafka` feature 开启时编译。
 
+use crate::broker_watchdog::BrokerWatchdog;
 use crate::cluster::{ClusterRegistryHandle, OAuthTokenSlot};
 use crate::error::WorkerError;
 use crate::producer::Producer;
@@ -9,6 +10,7 @@ use rdkafka::client::{ClientContext, OAuthToken};
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::message::{Header as RdHeader, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer as _};
+use rdkafka::statistics::Statistics;
 use rdkafka::ClientConfig;
 
 /// Producer 端的自定义 ClientContext，只为提供 OAuth token 回调。
@@ -17,10 +19,15 @@ use rdkafka::ClientConfig;
 struct ProducerOAuthCtx {
     cluster: String,
     oauth_slot: OAuthTokenSlot,
+    watchdog: Arc<BrokerWatchdog>,
 }
 
 impl ClientContext for ProducerOAuthCtx {
     const ENABLE_REFRESH_OAUTH_TOKEN: bool = true;
+
+    fn stats(&self, statistics: Statistics) {
+        self.watchdog.observe(&statistics);
+    }
 
     fn generate_oauth_token(
         &self,
@@ -219,6 +226,9 @@ impl KafkaProducer {
         {
             cfg.set("compression.codec", "lz4");
         }
+        for (key, value) in crate::cluster::CLIENT_DEFAULTS {
+            cfg.set(*key, *value);
+        }
         // 共享 Producer 的本地队列上限。librdkafka 默认 1 GiB 是按「每个进程一个客户端」
         // 设计的；这里一个 worker 服务整个节点的 PHP 进程，默认值会让 broker 变慢时
         // worker 内存涨到 GiB 级，进而被 OOMKill 并丢失全部排队消息。队列满时 FNF
@@ -238,13 +248,16 @@ impl KafkaProducer {
             .token_slot_for(cluster)
             .await
             .with_context(|| format!("token slot for cluster '{cluster}'"))?;
+        let watchdog = Arc::new(BrokerWatchdog::new(cfg.get("bootstrap.servers")));
         let ctx = ProducerOAuthCtx {
             cluster: cluster.to_string(),
             oauth_slot,
+            watchdog: watchdog.clone(),
         };
         let producer: OAuthFutureProducer = cfg
             .create_with_context(ctx)
             .with_context(|| format!("create FutureProducer for cluster '{cluster}'"))?;
+        watchdog.attach(producer.client().native_ptr());
 
         Ok(Arc::new(ClusterEntry {
             producer: Arc::new(producer),

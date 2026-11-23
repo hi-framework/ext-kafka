@@ -36,7 +36,7 @@ pcntl_signal(SIGINT, static function () use (&$stop): void {
 
 run_in_runtime($runtime, static function () use ($socket, $topic, $run, $id, $dir, $rate, $bytes, $runtime, $brokers, &$stop): void {
     $client = create_client($runtime, $socket);
-    $client->registerCluster('default', ['bootstrap.servers' => $brokers, 'linger.ms' => '1']);
+    $client->registerCluster('default', cluster_config($brokers));
     $ledger = open_ledger("{$dir}/acked-{$id}.log");
     $seqFile = "{$dir}/next-seq-{$id}";
     // 进程被重启时从上次的 seq 继续，保证同一 producer 的 seq 不复用。

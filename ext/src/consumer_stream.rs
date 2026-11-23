@@ -198,6 +198,10 @@ struct State {
     pending_message_credit: u32,
     pending_byte_credit: u64,
     outstanding_delivery_id: Option<u64>,
+    /// 控制操作（commit）等待响应期间到达的消息：next() 超时返回 null 时开出的 credit
+    /// 仍在 worker 侧，消息随时可能到达。暂存后由下一次 next() 交给业务，绝不丢弃——
+    /// 丢弃会让 worker 认为它已投递，单消息窗口从此不再补充。
+    prefetched: Option<ConsumeMessage>,
     pending_ack_delivery_id: Option<u64>,
     pending_ack_epoch: u64,
     pending_ack_wire_size: u64,
@@ -255,6 +259,7 @@ impl ConsumerStream {
                 pending_message_credit: ready.max_in_flight_messages,
                 pending_byte_credit: ready.max_in_flight_bytes,
                 outstanding_delivery_id: None,
+                prefetched: None,
                 pending_ack_delivery_id: None,
                 pending_ack_epoch: 0,
                 pending_ack_wire_size: 0,
@@ -282,6 +287,10 @@ impl ConsumerStream {
             return Err(PhpException::default(
                 "ack or nack the current message before calling next".into(),
             ));
+        }
+        if let Some(message) = state.prefetched.take() {
+            state.outstanding_delivery_id = Some(message.delivery_id);
+            return Ok(Some(ZendClassObject::new(message.into())));
         }
         let timeout = Duration::from_millis(timeoutMs.unwrap_or(30_000).max(1) as u64);
         if state.broken || state.stream.set_read_timeout(Some(timeout)).is_err() {
@@ -510,6 +519,7 @@ impl ConsumerStream {
                     state.epoch = notice.subscription_epoch;
                     if changed {
                         state.outstanding_delivery_id = None;
+                        state.prefetched = None;
                         clear_pending_ack(&mut state);
                         state.pending_message_credit = state.max_message_credit;
                         state.pending_byte_credit = state.max_byte_credit;
@@ -524,6 +534,20 @@ impl ConsumerStream {
                     return Err(PhpException::default(
                         "commit correlation id mismatch".into(),
                     ))
+                }
+                FrameType::ConsumeMessage => {
+                    let message = ConsumeMessage::decode_buf(payload)
+                        .map_err(|e| PhpException::default(e.to_string()))?;
+                    if message.subscription_id != state.subscription_id
+                        || message.subscription_epoch != state.epoch
+                        || state.prefetched.is_some()
+                        || state.outstanding_delivery_id.is_some()
+                    {
+                        return Err(PhpException::default(
+                            "unexpected ConsumeMessage while committing".into(),
+                        ));
+                    }
+                    state.prefetched = Some(message);
                 }
                 other => {
                     return Err(PhpException::default(format!(
@@ -790,6 +814,12 @@ fn fill_read_buffer(
         let read = stream.read(&mut buffer[start..]);
         let read = match read {
             Ok(read) => read,
+            // Linux 上设置了 SO_RCVTIMEO 的 socket 读取被信号打断时返回 EINTR，即使
+            // 信号处理器带 SA_RESTART（PHP pcntl、Swoole 的 SIGCHLD 等）。重试即可。
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                buffer.truncate(start);
+                continue;
+            }
             Err(error) => {
                 buffer.truncate(start);
                 return Err(error.into());
@@ -804,7 +834,7 @@ fn fill_read_buffer(
 }
 
 fn connect_hello(socket: &str, timeout: Duration) -> Result<UnixStream, ipc::IpcError> {
-    let mut stream = UnixStream::connect(socket)?;
+    let mut stream = crate::uds::connect(std::path::Path::new(socket), timeout)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     stream.write_all(
@@ -911,7 +941,11 @@ fn reconnect(state: &mut State, timeout: Duration) -> Result<(), ipc::IpcError> 
                 kind: ErrorKind::StaleEpoch,
                 ..
             }) if std::time::Instant::now() < deadline => {}
-            Err(error) if reconnectable(&error) && std::time::Instant::now() < deadline => {
+            // 连接超时（worker 冻结、监听队列已满）同样在 resume 窗口内重试。
+            Err(error)
+                if (reconnectable(&error) || timed_out(&error))
+                    && std::time::Instant::now() < deadline =>
+            {
                 crate::worker_health::invalidate(&state.socket);
             }
             Err(error) => return Err(error),
@@ -945,6 +979,8 @@ fn reopen(state: &mut State, timeout: Duration) -> Result<(), ipc::IpcError> {
 fn install_ready(state: &mut State, stream: UnixStream, ready: ConsumeReady) {
     state.stream = stream;
     state.broken = false;
+    // 新 epoch：旧连接上暂存的投递已失效，worker 会从最早未 ACK 位置重投。
+    state.prefetched = None;
     state.subscription_id = ready.subscription_id;
     state.epoch = ready.subscription_epoch;
     state.resume_token = ready.resume_token;

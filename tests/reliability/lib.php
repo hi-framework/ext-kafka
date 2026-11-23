@@ -98,6 +98,24 @@ function error_event(Throwable $error): array
 }
 
 /**
+ * 生产者与消费者注册的集群配置必须完全一致（与真实业务相同）。不一致会让每次
+ * 注册都覆盖配置、触发共享 Producer 换代，给测试引入无关变量。
+ *
+ * HI_KAFKA_RDKAFKA_DEBUG=broker,metadata,... 打开 librdkafka 内部日志（经 worker 日志输出）。
+ *
+ * @return array<string,string>
+ */
+function cluster_config(string $brokers): array
+{
+    $config = ['bootstrap.servers' => $brokers, 'linger.ms' => '1'];
+    if (false !== ($debug = getenv('HI_KAFKA_RDKAFKA_DEBUG')) && '' !== $debug) {
+        $config['debug'] = $debug;
+    }
+
+    return $config;
+}
+
+/**
  * 按运行时创建 Client。swoole / swow 需要已加载对应扩展且在协程内调用。
  */
 function create_client(string $runtime, string $socket): Hi\Kafka\ClientInterface

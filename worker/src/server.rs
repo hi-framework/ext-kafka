@@ -40,19 +40,54 @@ pub struct Server {
 }
 
 /// bind 时 socket 文件的 (dev, ino)。退出时据此判断路径上的文件是否仍是自己的。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// 仅比较 (dev, ino) 不可靠：Linux（ext4 / overlayfs 等）会把刚释放的 inode 立即分配给
+/// 新文件。旧 worker drain 开始时就关闭了监听 socket（它原本持有 inode 引用），新 worker
+/// 删除旧文件后重新 bind 常拿到同一个 inode 号，旧 worker 退出时便会误删新 socket。
+/// 因此在 Linux 上额外持有一个 `O_PATH` fd 钉住 inode，保证它在本 worker 退出前不会被
+/// 复用。macOS 不复用 inode 号，也没有 `O_PATH`。
+#[derive(Debug, Clone)]
 pub struct SocketIdentity {
     dev: u64,
     ino: u64,
+    #[cfg(target_os = "linux")]
+    _pin: Option<Arc<std::os::fd::OwnedFd>>,
+}
+
+impl PartialEq for SocketIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.dev == other.dev && self.ino == other.ino
+    }
 }
 
 fn identity_of(path: &Path) -> Option<SocketIdentity> {
     use std::os::unix::fs::MetadataExt;
+    #[cfg(target_os = "linux")]
+    // 不能用 OpenOptions::custom_flags：musl 的 O_ACCMODE 包含 O_PATH（O_SEARCH），
+    // std 会把它从自定义标志中屏蔽掉，退化为普通 open，对 socket 文件返回 ENXIO。
+    let pin = {
+        use std::os::fd::FromRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        std::ffi::CString::new(path.as_os_str().as_bytes())
+            .ok()
+            .and_then(|path| {
+                // SAFETY: path 是有效的 C 字符串；返回的 fd 由 OwnedFd 独占。
+                let fd = unsafe {
+                    libc::open(
+                        path.as_ptr(),
+                        libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                (fd >= 0).then(|| Arc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }))
+            })
+    };
     std::fs::symlink_metadata(path)
         .ok()
         .map(|meta| SocketIdentity {
             dev: meta.dev(),
             ino: meta.ino(),
+            #[cfg(target_os = "linux")]
+            _pin: pin,
         })
 }
 
@@ -60,8 +95,8 @@ fn identity_of(path: &Path) -> Option<SocketIdentity> {
 ///
 /// 旧 worker drain 期间已停止 accept，客户端会拉起新 worker 并在同一路径重新 bind；
 /// 旧 worker 退出时无条件删除会让新 worker 的 socket 消失、变得不可达。
-pub fn remove_socket_if_owned(path: &Path, identity: SocketIdentity) -> bool {
-    if identity_of(path) != Some(identity) {
+pub fn remove_socket_if_owned(path: &Path, identity: &SocketIdentity) -> bool {
+    if identity_of(path).as_ref() != Some(identity) {
         return false;
     }
     std::fs::remove_file(path).is_ok()
@@ -126,7 +161,7 @@ impl Server {
 
     /// 本 worker bind 的 socket 文件标识，交给 [`remove_socket_if_owned`] 在退出时使用。
     pub fn socket_identity(&self) -> SocketIdentity {
-        self.socket_identity
+        self.socket_identity.clone()
     }
 
     /// 主循环：accept → spawn connection task。task 句柄进 [`JoinSet`]，
