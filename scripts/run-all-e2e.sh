@@ -32,6 +32,7 @@ fi
 ALL_TESTS=(
     consumer-stream-v2
     producer-generation-v2
+    binary-roundtrip-v2
     consumer-record-memory-v2
     consumer-record-memory-swoole-v2
     coroutine-consumer-stream-v2

@@ -73,21 +73,22 @@ impl Client {
         Ok(())
     }
 
-    /// Fire-and-forget 生产。`$headers` 关联数组（`[]` = 无 headers）；
+    /// Fire-and-forget 生产。`$key` / `$value` 是任意字节（binary-safe，不要求 UTF-8）；
+    /// `$headers` 关联数组（`[]` = 无 headers，值同样是任意字节）；
     /// `$partition` 与 `$timestampMs` 可选，`null` / 缺省 = auto。
     #[php(defaults(headers = None, partition = None, timestampMs = None))]
     pub fn produce_fnf(
         &self,
         cluster: &str,
         topic: &str,
-        key: &str,
-        value: &str,
-        headers: Option<std::collections::HashMap<String, String>>,
+        key: ext_php_rs::binary_slice::BinarySlice<u8>,
+        value: ext_php_rs::binary_slice::BinarySlice<u8>,
+        headers: Option<&ext_php_rs::types::ZendHashTable>,
         partition: Option<i64>,
         timestampMs: Option<i64>,
     ) -> PhpResult<()> {
         let opts = super::build_options(headers, partition, timestampMs)?;
-        ipc::produce_fnf(&self.socket, cluster, topic, key, value, opts)
+        ipc::produce_fnf_bin(&self.socket, cluster, topic, &key, &value, opts)
             .map_err(super::ipc_err_to_php)
     }
 
@@ -97,9 +98,9 @@ impl Client {
         &self,
         cluster: &str,
         topic: &str,
-        key: &str,
-        value: &str,
-        headers: Option<std::collections::HashMap<String, String>>,
+        key: ext_php_rs::binary_slice::BinarySlice<u8>,
+        value: ext_php_rs::binary_slice::BinarySlice<u8>,
+        headers: Option<&ext_php_rs::types::ZendHashTable>,
         partition: Option<i64>,
         timestampMs: Option<i64>,
         timeoutMs: Option<i64>,
@@ -109,7 +110,7 @@ impl Client {
             timeoutMs.unwrap_or(5000),
         )? as u64);
         let opts = super::build_options(headers, partition, timestampMs)?;
-        let resp = ipc::produce_sync(&self.socket, cluster, topic, key, value, opts, timeout)
+        let resp = ipc::produce_sync_bin(&self.socket, cluster, topic, &key, &value, opts, timeout)
             .map_err(super::ipc_err_to_php)?;
         resp_to_zval(resp)
     }

@@ -415,6 +415,18 @@ async fn handle_connection(
             &expedited,
         )
         .await?;
+        release_oversized(&mut payload_buf);
+    }
+}
+
+/// 单条 RPC 连接在帧之间保留的读缓冲上限。
+const RPC_BUFFER_RETAIN: usize = 256 * 1024;
+
+/// 处理过大帧后归还缓冲。每个 PHP 进程会保留十几条空闲 RPC 连接，一条连接若长期
+/// 持有 MiB 级缓冲，worker 内存会随连接数线性放大。
+fn release_oversized(buffer: &mut BytesMut) {
+    if buffer.capacity() > RPC_BUFFER_RETAIN {
+        *buffer = BytesMut::new();
     }
 }
 
@@ -1000,4 +1012,20 @@ async fn write_error_frame(
 /// 关键：`NotFound → SUBSCRIPTION_NOT_FOUND`，让扩展端自愈从字符串匹配升级为 kind 判定。
 fn consumer_err_to_resp(e: &ConsumerError) -> ErrorResp {
     e.response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_rpc_buffer_is_released_between_frames() {
+        let mut small = BytesMut::with_capacity(4096);
+        release_oversized(&mut small);
+        assert!(small.capacity() >= 4096, "small buffers are reused");
+
+        let mut large = BytesMut::with_capacity(4 * 1024 * 1024);
+        release_oversized(&mut large);
+        assert_eq!(large.capacity(), 0);
+    }
 }

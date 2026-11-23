@@ -171,7 +171,13 @@ impl ConsumeMessage {
         Ok(())
     }
 
-    pub fn decode(mut buf: &[u8]) -> Result<Self, PayloadError> {
+    pub fn decode(buf: &[u8]) -> Result<Self, PayloadError> {
+        Self::decode_buf(buf)
+    }
+
+    /// 从任意 [`Buf`] 解码。传入 [`Bytes`] 时 key / value / header 值是对整帧缓冲的
+    /// 零拷贝切片：消费热路径上一条消息只保留一份 payload。
+    pub fn decode_buf<B: Buf>(mut buf: B) -> Result<Self, PayloadError> {
         require(&buf, 24)?;
         let subscription_id = buf.get_u64();
         let subscription_epoch = buf.get_u64();
@@ -463,7 +469,7 @@ fn write_count(count: usize, max: usize, buf: &mut BytesMut) -> Result<(), Paylo
     Ok(())
 }
 
-fn read_count(buf: &mut &[u8], max: usize) -> Result<usize, PayloadError> {
+fn read_count<B: Buf>(buf: &mut B, max: usize) -> Result<usize, PayloadError> {
     require(buf, 4)?;
     let count = buf.get_u32() as usize;
     if count > max {
@@ -532,12 +538,13 @@ fn write_str(value: &str, buf: &mut BytesMut) -> Result<(), PayloadError> {
     Ok(())
 }
 
-fn read_str(buf: &mut &[u8], field: &'static str) -> Result<String, PayloadError> {
+fn read_str<B: Buf>(buf: &mut B, field: &'static str) -> Result<String, PayloadError> {
     require(buf, 2)?;
     let len = buf.get_u16() as usize;
     require(buf, len)?;
-    String::from_utf8(buf.copy_to_bytes(len).to_vec())
-        .map_err(|_| PayloadError::InvalidUtf8 { field })
+    let mut bytes = vec![0; len];
+    buf.copy_to_slice(&mut bytes);
+    String::from_utf8(bytes).map_err(|_| PayloadError::InvalidUtf8 { field })
 }
 
 fn write_bytes(value: &[u8], buf: &mut BytesMut) -> Result<(), PayloadError> {
@@ -571,7 +578,7 @@ fn write_message_headers(
     Ok(())
 }
 
-fn read_message_headers(buf: &mut &[u8]) -> Result<Vec<MessageHeader>, PayloadError> {
+fn read_message_headers<B: Buf>(buf: &mut B) -> Result<Vec<MessageHeader>, PayloadError> {
     let count = read_count(buf, MAX_MESSAGE_HEADERS)?;
     let mut headers = Vec::with_capacity(count);
     for _ in 0..count {
@@ -580,14 +587,14 @@ fn read_message_headers(buf: &mut &[u8]) -> Result<Vec<MessageHeader>, PayloadEr
     Ok(headers)
 }
 
-fn read_bytes(buf: &mut &[u8]) -> Result<Bytes, PayloadError> {
+fn read_bytes<B: Buf>(buf: &mut B) -> Result<Bytes, PayloadError> {
     require(buf, 4)?;
     let len = buf.get_u32() as usize;
     require(buf, len)?;
     Ok(buf.copy_to_bytes(len))
 }
 
-fn read_nullable_bytes(buf: &mut &[u8]) -> Result<Option<Bytes>, PayloadError> {
+fn read_nullable_bytes<B: Buf>(buf: &mut B) -> Result<Option<Bytes>, PayloadError> {
     require(buf, 4)?;
     let len = buf.get_u32();
     if len == u32::MAX {
@@ -598,7 +605,7 @@ fn read_nullable_bytes(buf: &mut &[u8]) -> Result<Option<Bytes>, PayloadError> {
     Ok(Some(buf.copy_to_bytes(len)))
 }
 
-fn require(buf: &&[u8], len: usize) -> Result<(), PayloadError> {
+fn require<B: Buf>(buf: &B, len: usize) -> Result<(), PayloadError> {
     if buf.remaining() < len {
         return Err(PayloadError::Truncated);
     }
@@ -608,6 +615,37 @@ fn require(buf: &&[u8], len: usize) -> Result<(), PayloadError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consume_message_decoded_from_bytes_borrows_the_frame_buffer() {
+        let message = ConsumeMessage {
+            subscription_id: 1,
+            subscription_epoch: 2,
+            delivery_id: 3,
+            topic: "t".into(),
+            partition: 0,
+            offset: 9,
+            timestamp_ms: 0,
+            key: Some(Bytes::from_static(b"key")),
+            value: Some(Bytes::from(vec![7u8; 4096])),
+            headers: vec![("h".into(), Bytes::from_static(b"v"))],
+            wire_size: 4200,
+        };
+        let mut buf = BytesMut::new();
+        message.encode(&mut buf).unwrap();
+        let frame = buf.freeze();
+        let range = frame.as_ptr() as usize..frame.as_ptr() as usize + frame.len();
+
+        let decoded = ConsumeMessage::decode_buf(frame.clone()).unwrap();
+
+        assert_eq!(decoded, message);
+        let value = decoded.value.unwrap();
+        assert!(
+            range.contains(&(value.as_ptr() as usize)),
+            "value must be a zero-copy slice"
+        );
+        assert!(range.contains(&(decoded.headers[0].1.as_ptr() as usize)));
+    }
 
     fn open() -> ConsumeOpen {
         ConsumeOpen {

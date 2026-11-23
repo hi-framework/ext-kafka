@@ -12,6 +12,8 @@ Swoole/Swow 的 concurrency 表示同一 PHP process 内真实并发 coroutine�
 
 延迟最多均匀采样 10000 次，吞吐统计全部消息。Coroutine 在 warm-up 前由统一 gate 同时释放，每条 stream 完成自己的 warm-up 后直接进入 measured phase；禁止在 warm-up 后设置 barrier，因为零 credit 等待会按架构触发 Kafka pause/resume，把 idle 恢复延迟错误计入稳态吞吐。Runner 每 100ms 采样 PHP/worker RSS 与 CPU，采样频率可配置。
 
+payload 为随机 hex 文本（压缩比接近真实业务数据）。不要改回重复字节：lz4 会把它压缩到几乎为零，吞吐被严重高估，消费侧还会出现数百倍的解压内存放大。
+
 ## 快速运行
 
 ```bash

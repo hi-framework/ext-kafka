@@ -224,7 +224,10 @@ function benchmark(array $options): array
     $socket = $options['socket'];
     $topicPrefix = $options['topic'];
     $cluster = 'benchmark';
-    $payload = str_repeat('x', $messageBytes);
+    // 不能用 str_repeat：重复字节被 lz4 压缩到几乎为零，broker 与网络没有真实负载，
+    // 消费侧还会出现数百倍的解压放大。hex 文本的压缩比接近真实业务数据，且是合法
+    // UTF-8，旧版本扩展也能运行，便于与基线对比。
+    $payload = substr(bin2hex(random_bytes(intdiv($messageBytes + 1, 2))), 0, $messageBytes);
     $messageShards = shards($messages, $concurrency);
     $warmupShards = shards($warmup, $concurrency);
     $client = createClient($runtime, $socket, $concurrency);

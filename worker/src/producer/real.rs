@@ -72,6 +72,14 @@ impl ClusterCell {
     }
 }
 
+/// FNF 遇到本地队列满时等待空间的上限。
+const FNF_QUEUE_FULL_WAIT: Duration = Duration::from_secs(1);
+/// 队列满时两次重试 enqueue 的间隔。
+const QUEUE_FULL_RETRY_INTERVAL: Duration = Duration::from_millis(5);
+
+/// 共享 Producer 本地队列的默认字节上限（KiB）。
+const DEFAULT_QUEUE_BUFFERING_MAX_KBYTES: u32 = 128 * 1024;
+
 /// 配置变化后旧代 Producer 的最长排干时间。超时仍有未送达消息时，释放会让
 /// librdkafka purge 剩余队列，因此会以 error 日志报告丢失条数。
 const RETIRE_FLUSH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -211,6 +219,16 @@ impl KafkaProducer {
         {
             cfg.set("compression.codec", "lz4");
         }
+        // 共享 Producer 的本地队列上限。librdkafka 默认 1 GiB 是按「每个进程一个客户端」
+        // 设计的；这里一个 worker 服务整个节点的 PHP 进程，默认值会让 broker 变慢时
+        // worker 内存涨到 GiB 级，进而被 OOMKill 并丢失全部排队消息。队列满时 FNF
+        // 立即返回可重试的 PRODUCER_QUEUE_FULL。业务可在集群配置中覆盖。
+        if !cluster_cfg.contains_key("queue.buffering.max.kbytes") {
+            cfg.set(
+                "queue.buffering.max.kbytes",
+                DEFAULT_QUEUE_BUFFERING_MAX_KBYTES.to_string(),
+            );
+        }
         for (k, v) in &cluster_cfg {
             cfg.set(k, v);
         }
@@ -259,15 +277,26 @@ impl Producer for KafkaProducer {
         }
 
         // FNF 路径只做本地 enqueue：成功表示 librdkafka 已接受进本地队列，
-        // 不等待 broker delivery report。队列满 / 参数非法等同步错误仍返回业务。
-        match producer.send_result(record) {
-            Ok(_delivery_future) => {
-                debug!(cluster = %msg.cluster, topic = %msg.topic, "PRODUCE_FNF enqueued");
-                Ok(())
-            }
-            Err((err, _msg)) => {
-                warn!(cluster = %msg.cluster, topic = %msg.topic, error = ?err, "PRODUCE_FNF enqueue failed");
-                Err(anyhow::Error::new(kafka_error_to_worker(&err)))
+        // 不等待 broker delivery report。参数非法等同步错误立即返回业务；本地队列满时
+        // 在有界时间内等待空间，把背压以延迟而不是错误的形式传给调用方，超时后才返回
+        // 可重试的 PRODUCER_QUEUE_FULL。
+        let deadline = tokio::time::Instant::now() + FNF_QUEUE_FULL_WAIT;
+        loop {
+            match producer.send_result(record) {
+                Ok(_delivery_future) => {
+                    debug!(cluster = %msg.cluster, topic = %msg.topic, "PRODUCE_FNF enqueued");
+                    return Ok(());
+                }
+                Err((KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull), returned))
+                    if tokio::time::Instant::now() < deadline =>
+                {
+                    record = returned;
+                    tokio::time::sleep(QUEUE_FULL_RETRY_INTERVAL).await;
+                }
+                Err((err, _msg)) => {
+                    warn!(cluster = %msg.cluster, topic = %msg.topic, error = ?err, "PRODUCE_FNF enqueue failed");
+                    return Err(anyhow::Error::new(kafka_error_to_worker(&err)));
+                }
             }
         }
     }
@@ -327,9 +356,9 @@ impl Producer for KafkaProducer {
             record = record.headers(h.clone());
         }
 
-        // `send(..., 0)` 的第二参数只控制本地 enqueue 等待；delivery report 用
-        // API timeout 额外包一层，避免 PHP 端先超时而 worker 继续占住连接。
-        let delivery = producer.send(record, Duration::from_secs(0));
+        // `send` 的第二参数是本地队列满时等待 enqueue 的上限；外层 timeout 约束包括
+        // delivery report 在内的整次操作，避免 PHP 端先超时而 worker 继续占住连接。
+        let delivery = producer.send(record, timeout);
         match tokio::time::timeout(timeout, delivery).await {
             Ok(Ok(delivery)) => {
                 let partition = delivery.partition;
@@ -382,6 +411,8 @@ fn kafka_error_to_kind(err: &KafkaError) -> ErrorKind {
         }
         MessageSizeTooLarge => ErrorKind::RecordTooLarge,
         UnknownTopicOrPartition => ErrorKind::UnknownTopicOrPartition,
+        // 本地队列满是 worker 背压，不是 broker 故障；单独分类让业务可以退避或降级。
+        QueueFull => ErrorKind::ProducerQueueFull,
         c if is_retryable(&c) => ErrorKind::BrokerRetryable,
         _ => ErrorKind::Internal,
     }
@@ -526,7 +557,6 @@ mod tests {
         for c in [
             RDKafkaErrorCode::RequestTimedOut,
             RDKafkaErrorCode::LeaderNotAvailable,
-            RDKafkaErrorCode::QueueFull,
         ] {
             let err = KafkaError::MessageProduction(c);
             assert_eq!(
@@ -535,6 +565,13 @@ mod tests {
                 "{c:?} 应映射为 BrokerRetryable"
             );
         }
+    }
+
+    #[test]
+    fn test_local_queue_full_is_reported_as_producer_backpressure() {
+        let err = KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull);
+        assert_eq!(kafka_error_to_kind(&err), ErrorKind::ProducerQueueFull);
+        assert!(kafka_error_to_worker(&err).to_error_resp().retryable);
     }
 
     #[test]

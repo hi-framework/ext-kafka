@@ -188,16 +188,16 @@ pub fn hi_kafka_register_cluster(
 pub fn hi_kafka_produce_fnf(
     cluster: &str,
     topic: &str,
-    key: &str,
-    value: &str,
-    headers: Option<std::collections::HashMap<String, String>>,
+    key: BinarySlice<u8>,
+    value: BinarySlice<u8>,
+    headers: Option<&ZendHashTable>,
     partition: Option<i64>,
     timestamp_ms: Option<i64>,
     socket: Option<String>,
 ) -> PhpResult<()> {
     let socket = resolve_socket(socket.as_deref());
     let opts = build_options(headers, partition, timestamp_ms)?;
-    ipc::produce_fnf(&socket, cluster, topic, key, value, opts).map_err(ipc_err_to_php)
+    ipc::produce_fnf_bin(&socket, cluster, topic, &key, &value, opts).map_err(ipc_err_to_php)
 }
 
 /// 同步带 ack 全局函数 API。参数同 [`hi_kafka_produce_fnf`] + `timeout_ms`。
@@ -205,9 +205,9 @@ pub fn hi_kafka_produce_fnf(
 pub fn hi_kafka_produce_sync(
     cluster: &str,
     topic: &str,
-    key: &str,
-    value: &str,
-    headers: Option<std::collections::HashMap<String, String>>,
+    key: BinarySlice<u8>,
+    value: BinarySlice<u8>,
+    headers: Option<&ZendHashTable>,
     partition: Option<i64>,
     timestamp_ms: Option<i64>,
     timeout_ms: Option<i64>,
@@ -219,22 +219,18 @@ pub fn hi_kafka_produce_sync(
         timeout_ms.unwrap_or(5000),
     )? as u64);
     let opts = build_options(headers, partition, timestamp_ms)?;
-    let resp = ipc::produce_sync(&socket, cluster, topic, key, value, opts, timeout)
+    let resp = ipc::produce_sync_bin(&socket, cluster, topic, &key, &value, opts, timeout)
         .map_err(ipc_err_to_php)?;
     client::resp_to_zval(resp)
 }
 
 pub(crate) fn build_options(
-    headers: Option<std::collections::HashMap<String, String>>,
+    headers: Option<&ZendHashTable>,
     partition: Option<i64>,
     timestamp_ms: Option<i64>,
 ) -> PhpResult<ipc::ProduceOptions> {
     Ok(ipc::ProduceOptions {
-        headers: headers
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(k, v)| (k, bytes::Bytes::from(v.into_bytes())))
-            .collect(),
+        headers: parse_headers(headers)?,
         partition: partition
             .map(|p| require_i32("partition", p))
             .transpose()?
@@ -245,6 +241,35 @@ pub(crate) fn build_options(
 
 /// 把两个平行数组组合成 binary headers `Vec<(String, Bytes)>`。
 /// 头部 name UTF-8（Kafka 协议要求），value 任意字节。两数组长度必须一致。
+/// 解析 `array<string, string>` 消息头。header 值是任意字节（不要求 UTF-8），
+/// `null` 值被跳过，整数 / 浮点值按 PHP 字符串形式写入。
+pub(crate) fn parse_headers(
+    headers: Option<&ZendHashTable>,
+) -> PhpResult<Vec<(String, bytes::Bytes)>> {
+    let Some(headers) = headers else {
+        return Ok(Vec::new());
+    };
+    let mut parsed = Vec::with_capacity(headers.len());
+    for (name, value) in headers {
+        if value.is_null() {
+            continue;
+        }
+        let bytes = if let Some(value) = value.zend_str() {
+            bytes::Bytes::copy_from_slice(value.as_bytes())
+        } else if let Some(value) = value.long() {
+            bytes::Bytes::from(value.to_string())
+        } else if let Some(value) = value.double() {
+            bytes::Bytes::from(value.to_string())
+        } else {
+            return Err(PhpException::default(format!(
+                "header '{name}' must be a string"
+            )));
+        };
+        parsed.push((name.to_string(), bytes));
+    }
+    Ok(parsed)
+}
+
 pub(crate) fn build_binary_headers(
     names: Vec<String>,
     values: Vec<ext_php_rs::binary::Binary<u8>>,
@@ -448,9 +473,9 @@ pub fn hi_kafka_verify_hello_resp(bytes: BinarySlice<u8>) -> PhpResult<()> {
 pub fn hi_kafka_encode_fnf_frame(
     cluster: &str,
     topic: &str,
-    key: &str,
-    value: &str,
-    headers: Option<std::collections::HashMap<String, String>>,
+    key: BinarySlice<u8>,
+    value: BinarySlice<u8>,
+    headers: Option<&ZendHashTable>,
     partition: Option<i64>,
     timestamp_ms: Option<i64>,
 ) -> PhpResult<Binary<u8>> {
@@ -458,8 +483,8 @@ pub fn hi_kafka_encode_fnf_frame(
     let bytes = protocol::build_fnf_frame(
         cluster,
         topic,
-        key.as_bytes(),
-        value.as_bytes(),
+        &key,
+        &value,
         opts.headers,
         opts.partition,
         opts.timestamp_ms,
@@ -473,9 +498,9 @@ pub fn hi_kafka_encode_fnf_frame(
 pub fn hi_kafka_encode_req_frame(
     cluster: &str,
     topic: &str,
-    key: &str,
-    value: &str,
-    headers: Option<std::collections::HashMap<String, String>>,
+    key: BinarySlice<u8>,
+    value: BinarySlice<u8>,
+    headers: Option<&ZendHashTable>,
     partition: Option<i64>,
     timestamp_ms: Option<i64>,
     timeout_ms: Option<i64>,
@@ -485,8 +510,8 @@ pub fn hi_kafka_encode_req_frame(
     let (cid, bytes) = protocol::build_req_frame(
         cluster,
         topic,
-        key.as_bytes(),
-        value.as_bytes(),
+        &key,
+        &value,
         opts.headers,
         opts.partition,
         opts.timestamp_ms,

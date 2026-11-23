@@ -256,16 +256,6 @@ pub struct ProduceOptions {
 // 故意不 `derive(Default)`：默认 0 会被 rdkafka 当作「写第 0 分区 + 时间戳 0」
 // 而不是「auto」，是语义陷阱。要构造就显式给三个字段。
 
-fn encode_produce_payload(
-    cluster: &str,
-    topic: &str,
-    key: &str,
-    value: &str,
-    opts: &ProduceOptions,
-) -> Result<BytesMut, IpcError> {
-    encode_produce_payload_bin(cluster, topic, key.as_bytes(), value.as_bytes(), opts)
-}
-
 fn encode_produce_payload_bin(
     cluster: &str,
     topic: &str,
@@ -315,65 +305,7 @@ fn encode_produce_req_payload_bin(
     Ok(payload)
 }
 
-pub fn produce_fnf(
-    socket: &str,
-    cluster: &str,
-    topic: &str,
-    key: &str,
-    value: &str,
-    opts: ProduceOptions,
-) -> Result<(), IpcError> {
-    with_retry(socket, || {
-        produce_fnf_inner(socket, cluster, topic, key, value, &opts)
-    })
-}
-
-fn produce_fnf_inner(
-    socket: &str,
-    cluster: &str,
-    topic: &str,
-    key: &str,
-    value: &str,
-    opts: &ProduceOptions,
-) -> Result<(), IpcError> {
-    ensure(socket)?;
-    let payload = encode_produce_payload(cluster, topic, key, value, opts)?;
-    let cid = next_cid();
-    let pool = pool::pool_for(Path::new(socket));
-    let mut conn = pool.acquire()?;
-    let timeout = Duration::from_secs(5);
-    write_frame(
-        &mut conn,
-        FrameType::ProduceFnf,
-        cid,
-        &payload,
-        Some(timeout),
-    )?;
-    // FNF 分层：等 worker 本地 enqueue ack（不等 broker delivery）。同步可知的前置错误
-    // （cluster 未注册 / 队列满 / 参数非法）会以 Error 帧经 recv_resp 变成 IpcError::Worker。
-    let (kind, _payload) = recv_resp(&mut conn, cid, timeout)?;
-    if kind != FrameType::ProduceResp {
-        conn.poison();
-        return Err(IpcError::UnexpectedKind(kind));
-    }
-    Ok(())
-}
-
-pub fn produce_sync(
-    socket: &str,
-    cluster: &str,
-    topic: &str,
-    key: &str,
-    value: &str,
-    opts: ProduceOptions,
-    timeout: Duration,
-) -> Result<ProduceResp, IpcError> {
-    with_retry(socket, || {
-        produce_sync_inner(socket, cluster, topic, key, value, &opts, timeout)
-    })
-}
-
-/// Binary-safe 变体：key/value 接受任意字节。供 `produceFnfBin` / `produceSyncBin` 用。
+/// 生产一条消息；key / value 为任意字节（PHP 字符串是字节串，不要求 UTF-8）。
 pub fn produce_fnf_bin(
     socket: &str,
     cluster: &str,
@@ -441,45 +373,6 @@ fn produce_sync_bin_inner(
 ) -> Result<ProduceResp, IpcError> {
     ensure(socket)?;
     let payload = encode_produce_req_payload_bin(cluster, topic, key, value, opts, timeout)?;
-    let cid = next_cid();
-    let pool = pool::pool_for(Path::new(socket));
-    let mut conn = pool.acquire()?;
-
-    write_frame(
-        &mut conn,
-        FrameType::ProduceReq,
-        cid,
-        &payload,
-        Some(timeout),
-    )?;
-
-    let io_timeout = timeout + Duration::from_secs(2);
-    let (kind, resp_payload) = recv_resp(&mut conn, cid, io_timeout)?;
-    if kind != FrameType::ProduceResp {
-        conn.poison();
-        return Err(IpcError::UnexpectedKind(kind));
-    }
-    ProduceResp::decode(&resp_payload).map_err(|e| IpcError::DecodeResp(e.to_string()))
-}
-
-fn produce_sync_inner(
-    socket: &str,
-    cluster: &str,
-    topic: &str,
-    key: &str,
-    value: &str,
-    opts: &ProduceOptions,
-    timeout: Duration,
-) -> Result<ProduceResp, IpcError> {
-    ensure(socket)?;
-    let payload = encode_produce_req_payload_bin(
-        cluster,
-        topic,
-        key.as_bytes(),
-        value.as_bytes(),
-        opts,
-        timeout,
-    )?;
     let cid = next_cid();
     let pool = pool::pool_for(Path::new(socket));
     let mut conn = pool.acquire()?;
@@ -909,7 +802,7 @@ mod tests {
             partition: 0,
             timestamp_ms: 12345,
         };
-        let payload = encode_produce_payload("cluster", "topic", "k", "v", &opts).unwrap();
+        let payload = encode_produce_payload_bin("cluster", "topic", b"k", b"v", &opts).unwrap();
         // header key 字面量应能在 payload 里找到
         let s = String::from_utf8_lossy(&payload);
         assert!(s.contains("k1"), "header 键应被序列化");

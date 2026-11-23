@@ -190,7 +190,13 @@ impl ProduceFnf {
         Ok(())
     }
 
-    pub fn decode(mut buf: &[u8]) -> Result<Self, PayloadError> {
+    pub fn decode(buf: &[u8]) -> Result<Self, PayloadError> {
+        Self::decode_buf(buf)
+    }
+
+    /// 从任意 [`Buf`] 解码。传入 [`Bytes`] 时 key / value / header 值是对输入缓冲的
+    /// 零拷贝切片，不再复制 payload。
+    pub fn decode_buf<B: Buf>(mut buf: B) -> Result<Self, PayloadError> {
         let cluster = read_str_u16(&mut buf, "cluster")?;
         let topic = read_str_u16(&mut buf, "topic")?;
         let key = read_bytes_u32(&mut buf)?;
@@ -228,7 +234,7 @@ pub(crate) fn write_headers(
     Ok(())
 }
 
-pub(crate) fn read_headers(buf: &mut &[u8]) -> Result<Vec<MessageHeader>, PayloadError> {
+pub(crate) fn read_headers<B: Buf>(buf: &mut B) -> Result<Vec<MessageHeader>, PayloadError> {
     if buf.remaining() < 4 {
         return Err(PayloadError::Truncated);
     }
@@ -258,7 +264,12 @@ impl ProduceReq {
         Ok(())
     }
 
-    pub fn decode(mut buf: &[u8]) -> Result<Self, PayloadError> {
+    pub fn decode(buf: &[u8]) -> Result<Self, PayloadError> {
+        Self::decode_buf(buf)
+    }
+
+    /// 同 [`ProduceFnf::decode_buf`]：传入 [`Bytes`] 时 payload 零拷贝。
+    pub fn decode_buf<B: Buf>(mut buf: B) -> Result<Self, PayloadError> {
         let cluster = read_str_u16(&mut buf, "cluster")?;
         let topic = read_str_u16(&mut buf, "topic")?;
         let key = read_bytes_u32(&mut buf)?;
@@ -386,7 +397,10 @@ fn write_bytes_u32(b: &[u8], buf: &mut BytesMut) -> Result<(), PayloadError> {
     Ok(())
 }
 
-fn read_str_u16(buf: &mut &[u8], field: &'static str) -> Result<String, PayloadError> {
+pub(crate) fn read_str_u16<B: Buf>(
+    buf: &mut B,
+    field: &'static str,
+) -> Result<String, PayloadError> {
     if buf.remaining() < 2 {
         return Err(PayloadError::Truncated);
     }
@@ -394,11 +408,13 @@ fn read_str_u16(buf: &mut &[u8], field: &'static str) -> Result<String, PayloadE
     if buf.remaining() < len {
         return Err(PayloadError::Truncated);
     }
-    let bytes = buf.copy_to_bytes(len).to_vec();
+    let mut bytes = vec![0; len];
+    buf.copy_to_slice(&mut bytes);
     String::from_utf8(bytes).map_err(|_| PayloadError::InvalidUtf8 { field })
 }
 
-fn read_bytes_u32(buf: &mut &[u8]) -> Result<Bytes, PayloadError> {
+/// 对 [`Bytes`] 是零拷贝切片，对 `&[u8]` 复制一次。
+fn read_bytes_u32<B: Buf>(buf: &mut B) -> Result<Bytes, PayloadError> {
     if buf.remaining() < 4 {
         return Err(PayloadError::Truncated);
     }

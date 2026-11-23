@@ -6,11 +6,12 @@
 #![allow(non_snake_case)]
 
 use crate::{ipc, protocol};
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use ext_php_rs::boxed::ZBox;
 use ext_php_rs::convert::IntoZval;
+use ext_php_rs::flags::DataType;
 use ext_php_rs::prelude::*;
-use ext_php_rs::types::{ZendClassObject, ZendHashTable, ZendObject, Zval};
+use ext_php_rs::types::{ZendClassObject, ZendHashTable, ZendObject, ZendStr, Zval};
 use hi_kafka_proto::{
     codec, encode_frame, ConnectionRole, ConsumeAck, ConsumeClose, ConsumeCommit, ConsumeCommitted,
     ConsumeMessage, ConsumeNack, ConsumeOpen, ConsumeReady, ConsumeResume, ConsumerPartitions,
@@ -35,10 +36,24 @@ pub struct ConsumerRecord {
     partition: i32,
     offset: i64,
     timestamp_ms: i64,
-    key: Option<Vec<u8>>,
-    value: Option<Vec<u8>>,
-    headers: Vec<(String, Vec<u8>)>,
+    key: Option<Bytes>,
+    value: Option<Bytes>,
+    headers: Vec<(String, Bytes)>,
     wire_size: u64,
+}
+
+/// 以 PHP binary string 交出 Kafka 字节：Zend 拥有一份拷贝（不可避免），Rust 侧
+/// 不再先克隆一个 `Vec`。
+pub struct PhpBytes<'a>(&'a [u8]);
+
+impl IntoZval for PhpBytes<'_> {
+    const TYPE: DataType = DataType::String;
+    const NULLABLE: bool = false;
+
+    fn set_zval(self, zv: &mut Zval, persistent: bool) -> ext_php_rs::error::Result<()> {
+        zv.set_zend_string(ZendStr::new(self.0, persistent));
+        Ok(())
+    }
 }
 
 #[php_impl]
@@ -80,7 +95,7 @@ impl ConsumerRecord {
                 let value = header
                     .get("value")
                     .and_then(Zval::zend_str)
-                    .map(|value| value.as_bytes().to_vec())
+                    .map(|value| Bytes::copy_from_slice(value.as_bytes()))
                     .ok_or_else(|| {
                         PhpException::default("header value must be a string".to_string())
                     })?;
@@ -95,8 +110,8 @@ impl ConsumerRecord {
             partition,
             offset,
             timestamp_ms: timestampMs,
-            key: key.map(|value| value.into()),
-            value: value.map(|value| value.into()),
+            key: key.map(|value| Bytes::from(Vec::<u8>::from(value))),
+            value: value.map(|value| Bytes::from(Vec::<u8>::from(value))),
             headers: parsed_headers,
             wire_size: unsigned("wireSize", wireSize)?,
         })
@@ -126,11 +141,11 @@ impl ConsumerRecord {
     pub fn wire_size(&self) -> i64 {
         self.wire_size as i64
     }
-    pub fn key(&self) -> Option<ext_php_rs::binary::Binary<u8>> {
-        self.key.clone().map(Into::into)
+    pub fn key(&self) -> Option<PhpBytes<'_>> {
+        self.key.as_deref().map(PhpBytes)
     }
-    pub fn value(&self) -> Option<ext_php_rs::binary::Binary<u8>> {
-        self.value.clone().map(Into::into)
+    pub fn value(&self) -> Option<PhpBytes<'_>> {
+        self.value.as_deref().map(PhpBytes)
     }
     pub fn headers(&self) -> PhpResult<Zval> {
         let mut values = ZendHashTable::new();
@@ -140,7 +155,7 @@ impl ConsumerRecord {
                 .insert("name", name.as_str())
                 .map_err(|e| PhpException::default(format!("header name: {e}")))?;
             header
-                .insert("value", ext_php_rs::binary::Binary::from(value.clone()))
+                .insert("value", PhpBytes(value))
                 .map_err(|e| PhpException::default(format!("header value: {e}")))?;
             values
                 .push(header)
@@ -162,13 +177,9 @@ impl From<ConsumeMessage> for ConsumerRecord {
             partition: value.partition,
             offset: value.offset,
             timestamp_ms: value.timestamp_ms,
-            key: value.key.map(|bytes| bytes.to_vec()),
-            value: value.value.map(|bytes| bytes.to_vec()),
-            headers: value
-                .headers
-                .into_iter()
-                .map(|(k, v)| (k, v.to_vec()))
-                .collect(),
+            key: value.key,
+            value: value.value,
+            headers: value.headers,
             wire_size: value.wire_size,
         }
     }
@@ -320,7 +331,7 @@ impl ConsumerStream {
             };
             match kind {
                 FrameType::ConsumeMessage => {
-                    let message = ConsumeMessage::decode(&payload)
+                    let message = ConsumeMessage::decode_buf(payload)
                         .map_err(|e| PhpException::default(e.to_string()))?;
                     if message.subscription_id != state.subscription_id
                         || message.subscription_epoch != state.epoch
@@ -707,31 +718,52 @@ fn read_frame(stream: &mut UnixStream) -> Result<(FrameType, u64, Vec<u8>), ipc:
     Ok((header.kind, header.cid, payload))
 }
 
+/// 读出一帧并返回其 payload。
+///
+/// 帧至少占读缓冲剩余容量的一半时，payload 直接引用该缓冲（零拷贝）；否则复制到
+/// 恰好大小的独立分配。这样大消息省掉一次整帧拷贝，而业务长期持有的小 record
+/// 也不会把整块读缓冲钉在内存里（常驻放大至多 2 倍）。
 fn read_frame_buffered(
     stream: &mut UnixStream,
     buffer: &mut BytesMut,
-) -> Result<(FrameType, u64, Vec<u8>), ipc::IpcError> {
+) -> Result<(FrameType, u64, Bytes), ipc::IpcError> {
     fill_read_buffer(stream, buffer, HEADER_LEN)?;
     let header = codec::decode_header(&buffer[..HEADER_LEN])
         .map_err(|e| ipc::IpcError::DecodeResp(e.to_string()))?;
     let frame_len = HEADER_LEN + header.payload_len as usize;
     fill_read_buffer(stream, buffer, frame_len)?;
+    let capacity = buffer.capacity();
     let frame = buffer.split_to(frame_len);
-    Ok((header.kind, header.cid, frame[HEADER_LEN..].to_vec()))
+    let payload = if frame_len.saturating_mul(2) >= capacity {
+        frame.freeze().slice(HEADER_LEN..)
+    } else {
+        Bytes::copy_from_slice(&frame[HEADER_LEN..])
+    };
+    Ok((header.kind, header.cid, payload))
 }
 
+/// 直接读进缓冲区，不经过中间 chunk。
 fn fill_read_buffer(
     stream: &mut UnixStream,
     buffer: &mut BytesMut,
     required: usize,
 ) -> Result<(), ipc::IpcError> {
-    let mut chunk = [0u8; READ_CHUNK_BYTES];
     while buffer.len() < required {
-        let read = stream.read(&mut chunk)?;
+        let start = buffer.len();
+        let want = (required - start).max(READ_CHUNK_BYTES);
+        buffer.resize(start + want, 0);
+        let read = stream.read(&mut buffer[start..]);
+        let read = match read {
+            Ok(read) => read,
+            Err(error) => {
+                buffer.truncate(start);
+                return Err(error.into());
+            }
+        };
+        buffer.truncate(start + read);
         if read == 0 {
             return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
         }
-        buffer.extend_from_slice(&chunk[..read]);
     }
     Ok(())
 }
@@ -925,12 +957,42 @@ mod tests {
 
         let mut buffer = BytesMut::new();
         let first = read_frame_buffered(&mut reader, &mut buffer).expect("read first");
-        assert_eq!(first, (FrameType::Ping, 11, Vec::new()));
+        assert_eq!(first, (FrameType::Ping, 11, Bytes::new()));
         assert!(!buffer.is_empty());
 
         let second = read_frame_buffered(&mut reader, &mut buffer).expect("read second");
-        assert_eq!(second, (FrameType::Pong, 12, b"second".to_vec()));
+        assert_eq!(second, (FrameType::Pong, 12, Bytes::from_static(b"second")));
         assert!(buffer.is_empty());
+    }
+
+    /// 小帧复制到独立分配，不把整块读缓冲钉在业务长期持有的 record 上；
+    /// 占满缓冲的大帧直接零拷贝引用。
+    #[test]
+    fn small_frames_are_copied_and_large_frames_are_borrowed() {
+        let (mut writer, mut reader) = UnixStream::pair().expect("unix stream pair");
+        let large = vec![7u8; 1 << 20];
+        let mut wire = BytesMut::new();
+        encode_frame(FrameType::Pong, 1, b"tiny", &mut wire).expect("small frame");
+        encode_frame(FrameType::Pong, 2, &large, &mut wire).expect("large frame");
+        let writer_thread = std::thread::spawn(move || writer.write_all(&wire));
+
+        let mut buffer = BytesMut::new();
+        let (_, _, small) = read_frame_buffered(&mut reader, &mut buffer).expect("small");
+        let remaining = buffer.as_ptr() as usize..buffer.as_ptr() as usize + buffer.capacity();
+        assert!(
+            !remaining.contains(&(small.as_ptr() as usize)),
+            "small payload must not alias the read buffer"
+        );
+
+        let before = buffer.as_ptr() as usize;
+        let (_, _, payload) = read_frame_buffered(&mut reader, &mut buffer).expect("large");
+        assert_eq!(payload.len(), large.len());
+        let start = payload.as_ptr() as usize - HEADER_LEN;
+        assert!(
+            start >= before || buffer.capacity() == 0,
+            "large payload is borrowed in place"
+        );
+        writer_thread.join().unwrap().unwrap();
     }
 
     #[test]

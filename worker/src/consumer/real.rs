@@ -21,6 +21,12 @@ use rdkafka::{ClientConfig, Offset};
 use std::sync::{Arc, Mutex};
 use tracing::warn;
 
+/// librdkafka 本地队列低于该条数时继续 fetch。预取内存的上界由强制设置的
+/// `queued.max.messages.kbytes` 保证，这里只影响流水线深度。2026-11 在单节点 colima
+/// broker 上对比 1 / 100 / 1000 / 100000：前三者差异落在噪声内，librdkafka 默认
+/// 100000 在 1 KiB 消息下稳定更慢，因此保留 1。高延迟 broker 可在 consumer 配置中覆盖。
+const DEFAULT_QUEUED_MIN_MESSAGES: &str = "1";
+
 pub struct KafkaSourceFactory {
     registry: ClusterRegistryHandle,
 }
@@ -142,18 +148,22 @@ impl ConsumerSourceFactory for KafkaSourceFactory {
             cluster: request.cluster.clone(),
         };
         let mut config = ClientConfig::new();
+        // 可调的默认值：本地预取队列的内存上界由下面强制的 queued.max.messages.kbytes
+        // 保证，这里只决定流水线深度。
+        config
+            .set("queued.min.messages", DEFAULT_QUEUED_MIN_MESSAGES)
+            .set("fetch.queue.backoff.ms", "10");
         for (key, value) in cluster_config {
             config.set(key, value);
         }
         for (key, value) in &request.config {
             config.set(key, value);
         }
+        // 不变量：只有应用 ACK 能推进 offset；预取字节受 credit 窗口约束。
         config
             .set("group.id", &request.group_id)
             .set("enable.auto.commit", "false")
             .set("enable.auto.offset.store", "false")
-            .set("queued.min.messages", "1")
-            .set("fetch.queue.backoff.ms", "10")
             .set(
                 "queued.max.messages.kbytes",
                 request
