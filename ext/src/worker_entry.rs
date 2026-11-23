@@ -5,6 +5,7 @@
 //! **不再 exec 外部二进制**。
 //!
 //! 子进程做的事：
+//! 0. 关闭继承的全部 fd，清空信号屏蔽字
 //! 1. `setsid()` 脱离 PHP 会话
 //! 2. 关 stdin/stdout/stderr（或重定向到日志文件）
 //! 3. 重置 SIGTERM/SIGINT 默认行为
@@ -46,7 +47,18 @@ pub struct ChildConfig {
 /// - 调用方负责确保已在子进程语境
 /// - 调用方负责在 fork 后 setsid 之前不要调用任何 PHP 函数
 pub unsafe fn run_in_child(config: ChildConfig) -> ! {
-    // 1. 脱离 PHP 会话
+    // 0. 关闭继承自 PHP 的全部 fd（监听端口、数据库/Redis 连接、spawn 锁……）。
+    //    worker 是长驻进程：继承的监听 socket 会让 PHP 服务重启时端口被占用，继承的
+    //    客户端连接永远不会关闭；继承的 spawn 锁会让锁在 worker 存活期间一直被持有。
+    //    同时清空信号屏蔽字：调用线程可能屏蔽了 SIGTERM，worker 将无法优雅退出。
+    unsafe {
+        close_inherited_fds();
+        let mut empty: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut empty);
+        libc::pthread_sigmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
+    }
+
+    // 1. 脱离 PHP 会话（double fork 的中间进程已经 setsid；这里对直接调用方兜底）
     unsafe { libc::setsid() };
 
     // 2. 改进程名让 pgrep/ps 能识别（最长 15 字符 + null）
@@ -190,6 +202,23 @@ async fn run_server(config: ChildConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 关闭 fd >= 3。优先用 Linux `close_range`，否则遍历到 fd 上限（封顶 65536）。
+unsafe fn close_inherited_fds() {
+    #[cfg(target_os = "linux")]
+    {
+        if unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) } == 0 {
+            return;
+        }
+    }
+    let max = match unsafe { libc::sysconf(libc::_SC_OPEN_MAX) } {
+        n if n > 0 => n.min(65_536) as libc::c_int,
+        _ => 4096,
+    };
+    for fd in 3..max {
+        unsafe { libc::close(fd) };
+    }
+}
+
 fn pid_file_for(socket: &std::path::Path) -> std::path::PathBuf {
     let mut p = socket.to_path_buf();
     let stem = p.file_name().map(|s| s.to_os_string()).unwrap_or_default();
@@ -236,8 +265,7 @@ fn redirect_stdio(log_file: Option<&std::path::Path>) {
         libc::dup2(target_fd, libc::STDERR_FILENO);
     }
 
-    // 关闭其它从 PHP 继承的 fd（保守保留 0/1/2 和 socket 监听用的）
-    // PHP-FPM 通常会自己处理；这里只清理 stdio。
+    // 其它继承的 fd 已在 run_in_child 开头由 close_inherited_fds 关闭。
     drop(dev_null);
     drop(out_fd);
 }

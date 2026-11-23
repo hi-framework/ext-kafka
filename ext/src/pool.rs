@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -42,6 +43,9 @@ pub struct ConnectionPool {
     socket: PathBuf,
     max_idle: usize,
     idle: Mutex<Vec<UnixStream>>,
+    /// 创建这些空闲连接的进程。fork（例如 `pcntl_fork`）后子进程继承同一批 fd，
+    /// 父子进程读写同一条字节流会让响应被对方读走，必须丢弃继承的连接。
+    owner_pid: AtomicU32,
     /// 累计统计
     stats: Mutex<PoolStats>,
 }
@@ -61,7 +65,17 @@ impl ConnectionPool {
             socket,
             max_idle,
             idle: Mutex::new(Vec::new()),
+            owner_pid: AtomicU32::new(std::process::id()),
             stats: Mutex::new(PoolStats::default()),
+        }
+    }
+
+    /// 检测到 fork 后丢弃继承的空闲连接。关闭的只是子进程自己的 fd 副本，
+    /// 父进程的连接不受影响。
+    fn check_owner(&self) {
+        let pid = std::process::id();
+        if self.owner_pid.swap(pid, Ordering::AcqRel) != pid {
+            self.clear_idle();
         }
     }
 
@@ -75,6 +89,7 @@ impl ConnectionPool {
 
     /// 取一个连接出来。优先复用 idle 里的，否则新建。
     pub fn acquire(self: &Arc<Self>) -> Result<PooledConn, PoolError> {
+        self.check_owner();
         self.stats.lock().unwrap().acquires_total += 1;
 
         // 尝试从 idle 弹一个
@@ -121,6 +136,10 @@ impl ConnectionPool {
     }
 
     fn release(&self, stream: UnixStream) {
+        // fork 前取出、fork 后归还的连接同样不属于当前进程。
+        if self.owner_pid.load(Ordering::Acquire) != std::process::id() {
+            return;
+        }
         let mut idle = self.idle.lock().unwrap();
         if idle.len() < self.max_idle {
             idle.push(stream);

@@ -3,7 +3,7 @@
 状态：Accepted  
 适用范围：hi-kafka 扩展、内嵌 worker、IPC 协议、PHP driver 与框架 Kafka 集成  
 目标协议：v2  
-最后更新：2026-07-27
+最后更新：2026-11-23
 
 ## 1. 文档权威性
 
@@ -198,7 +198,8 @@ worker 的唯一键是规范化后的 socket 路径。
 - spawn lock MUST 保证只有一个进程负责启动；
 - readiness MUST 通过 HELLO 验证，而不只是 connect 成功；
 - PID 文件只用于观测，不能作为唯一存活判断；
-- 旧 socket、错误版本和半启动 worker 必须被明确识别。
+- 旧 socket、错误版本和半启动 worker 必须被明确识别；
+- bind 时只清理无人监听的残留 socket 文件；路径上已有可连接的 worker 时 MUST 拒绝启动，不得删除后重新 bind（否则新老 worker 同时存活，客户端分裂到两个实例）。
 
 “一个 worker”指一个 socket namespace 内的一个 worker，不泛化为整台 Kubernetes node。不同 Pod 或不共享 socket namespace 的容器自然拥有各自 worker。
 
@@ -206,17 +207,20 @@ worker 的唯一键是规范化后的 socket 路径。
 
 当前架构继续使用扩展内嵌 worker，但启动必须满足：
 
-- Swoole/Swow reactor 和第三方后台线程启动前调用 ensureWorker；
-- 生产环境多线程检测 MUST fail closed；
-- 多线程状态下禁止仅记录 warning 后继续 fork；
-- lazy ensure 仅允许在确认单线程的运行时作为恢复路径；
+- Swoole/Swow reactor 和第三方后台线程启动前 SHOULD 调用 ensureWorker；
+- 采用 double fork：中间进程只调用 async-signal-safe 的 `setsid`/`fork`/`write`/`_exit`，经 pipe 回报 worker PID 后退出并被 spawner 回收；worker 从启动起即被 init 收养，不成为 PHP-FPM / Swoole manager 的子进程；
 - fork 子进程不得调用 PHP API；
-- worker 子进程必须重置信号、stdio 和 runtime；
-- worker readiness 只有在监听 socket、runtime 和协议 HELLO 全部可用后成立。
+- worker MUST 在任何其它动作之前关闭全部继承的 fd（≥ 3）并清空信号屏蔽字，随后重置信号处理器、stdio 和 runtime；
+- worker readiness 只有在监听 socket、runtime 和协议 HELLO 全部可用后成立；
+- 在就绪期限内未完成 HELLO 的 worker MUST 被 spawner SIGKILL，下一次 ensure 重新拉起。
+
+多线程进程中的 fork：子进程可能继承其它线程持有的锁（malloc 等）而死锁。默认策略是允许 fork、记录 warning，并依赖「就绪超时即 SIGKILL」把最坏情况限定为一次有界的启动失败；`HI_KAFKA_STRICT_FORK=1` 时严格拒绝。
+
+不采用默认 fail closed 的原因：worker 崩溃后的惰性恢复通常发生在 Swoole worker 进程中，而 Linux 上 Swoole worker 一旦使用过协程文件 IO 就带有异步线程池。拒绝 fork 会让 Kafka 在进程重启前一直不可用，可用性损失大于一次可回收的启动失败。框架 SHOULD 在 reactor 启动前于 master 中 ensure，使惰性 fork 只作为恢复路径。
 
 ### 6.3 PHP fork 安全
 
-所有 PHP client、连接池和 stream 对象 MUST 保存 owner PID。
+所有 PHP client、连接池和 stream 对象 MUST 保存 owner PID（扩展 Rust 连接池与协程 `CoroutineRpcClient` 已实现）。
 
 检测到 PID 改变时必须：
 

@@ -66,7 +66,16 @@ impl Server {
         idle_timeout: Duration,
     ) -> anyhow::Result<Self> {
         if socket.exists() {
-            std::fs::remove_file(socket).context("remove stale socket")?;
+            // 只清理无人监听的残留 socket。路径上已有活着的 worker 时绝不能抢占：
+            // 删除后重新 bind 会让新老两个 worker 同时存活，已连接的客户端与新连接
+            // 分别落在不同实例上（例如 spawn 探测因 accept 队列满而误判 worker 已死）。
+            match std::os::unix::net::UnixStream::connect(socket) {
+                Ok(_) => anyhow::bail!(
+                    "socket {} is already served by a running worker",
+                    socket.display()
+                ),
+                Err(_) => std::fs::remove_file(socket).context("remove stale socket")?,
+            }
         }
         if let Some(parent) = socket.parent() {
             std::fs::create_dir_all(parent).context("create socket parent dir")?;

@@ -6,12 +6,23 @@
 //! 同 pod 内多个 PHP 进程并发到这一步时只有一个能拿到锁、负责 fork，
 //! 其它等 socket 出现。
 //!
-//! 父子分离：子进程 `setsid()` 脱离 PHP 会话 + 关 stdio + 重置信号处理器。
-//! PHP 父进程退出后，子进程被 init/PID1 收养，成为节点级守护。
+//! 进程模型：double fork。中间进程只调用 async-signal-safe 的 `setsid` / `fork` /
+//! `write` / `_exit`，经 pipe 回报孙进程 PID 后立即退出并被 spawner `waitpid` 回收；
+//! worker（孙进程）从一开始就被 init 收养，不会成为 PHP-FPM / Swoole manager 的
+//! 子进程（不留僵尸、不干扰它们的 SIGCHLD 处理）。worker 启动后先关闭全部继承的 fd。
+//!
+//! 就绪判定：HELLO 握手成功才算就绪（connect 成功不够：可能是旧版本、半启动或
+//! 卡死的 worker）。超时未就绪的孙进程会被 SIGKILL：在多线程进程中 fork 时，子进程
+//! 可能继承其它线程持有的锁而死锁，这里保证最坏情况是一次有界的启动失败，而不是
+//! 一个永远不就绪、却占着 socket namespace 的僵死进程。
 
+use crate::protocol;
 use crate::worker_entry::{self, ChildConfig};
+use hi_kafka_proto::HEADER_LEN;
 use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -78,9 +89,35 @@ pub enum SpawnOutcome {
     JustSpawned,
 }
 
-/// 检测 worker 是否在跑：尝试 connect socket。
+/// 单次探测的 IO 上限。worker 正常时 HELLO 是亚毫秒级。
+const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
+
+/// 检测 worker 是否可用：connect 并完成 protocol HELLO。
 pub fn worker_alive(socket: &Path) -> bool {
-    std::os::unix::net::UnixStream::connect(socket).is_ok()
+    handshake(socket, PROBE_TIMEOUT).is_some()
+}
+
+/// 直连 socket 并完成 HELLO 握手（RPC 角色）。任一步失败返回 `None`。
+pub fn handshake(socket: &Path, timeout: Duration) -> Option<UnixStream> {
+    let mut stream = UnixStream::connect(socket).ok()?;
+    stream.set_read_timeout(Some(timeout)).ok()?;
+    stream.set_write_timeout(Some(timeout)).ok()?;
+
+    let hello = protocol::build_hello_frame().ok()?;
+    stream.write_all(&hello).ok()?;
+
+    let mut header = [0u8; HEADER_LEN];
+    stream.read_exact(&mut header).ok()?;
+    let payload_len = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
+    // HELLO RESP payload 只有几个字节；异常大说明对端不是本协议的 worker。
+    if payload_len > 64 {
+        return None;
+    }
+    let mut full = vec![0u8; HEADER_LEN + payload_len];
+    full[..HEADER_LEN].copy_from_slice(&header);
+    stream.read_exact(&mut full[HEADER_LEN..]).ok()?;
+    protocol::parse_hello_resp(&full).ok()?;
+    Some(stream)
 }
 
 /// 主入口：保证 socket 后面有一个能响应的 worker。
@@ -107,9 +144,18 @@ pub fn ensure_worker(cfg: &SpawnConfig) -> Result<SpawnOutcome, SpawnError> {
 
     let deadline = Instant::now() + cfg.ready_timeout;
     if got_lock {
-        // 拿到锁的进程负责 spawn
-        spawn_worker_inproc(cfg)?;
-        wait_for_socket(&cfg.socket, deadline)?;
+        // 拿锁后再探测一次：可能在我们等锁之前别的进程刚完成启动。
+        if worker_alive(&cfg.socket) {
+            return Ok(SpawnOutcome::AlreadyAlive);
+        }
+        let pid = spawn_worker_inproc(cfg)?;
+        if let Err(error) = wait_for_socket(&cfg.socket, deadline) {
+            // 未就绪的 worker 可能已经死锁；杀掉它，让下一次 ensure 干净地重试。
+            if pid > 0 {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+            return Err(error);
+        }
     } else {
         // 别的进程在 spawn，等 socket 就绪
         wait_for_socket(&cfg.socket, deadline)?;
@@ -134,23 +180,18 @@ fn try_flock_ex_nb(file: &File) -> bool {
     rc == 0
 }
 
-/// 在 .so 内 fork 出 worker 子进程。
+/// 在 .so 内 double fork 出 worker，返回 worker（孙进程）的 PID；无法获知时返回 0。
 ///
-/// 父：返回 Ok 让 PHP 继续
-/// 子：跳到 [`worker_entry::run_in_child`]，**永不返回**
-fn spawn_worker_inproc(cfg: &SpawnConfig) -> Result<(), SpawnError> {
-    // N: fork-after-threads 防护。
+/// 父：回收中间进程后返回，由调用方等待就绪
+/// 孙：跳到 [`worker_entry::run_in_child`]，**永不返回**
+fn spawn_worker_inproc(cfg: &SpawnConfig) -> Result<libc::pid_t, SpawnError> {
+    // 多线程进程中 fork：子进程只剩调用线程，其它线程持有的锁（malloc 等）可能
+    // 永久不释放。危险线程多来自第三方扩展（Sentry / OTel / Swoole 异步 IO 线程池）；
+    // macOS 的 libdispatch 等系统线程不构成风险（PHP CLI 启动即有 3 个）。
     //
-    // 风险：子进程 fork 后只剩调用线程，其它线程持有的 heap/runtime 锁会永久
-    // 死锁。但实际"危险线程"只有第三方扩展（Sentry / OTel / pthreads / Swoole
-    // background workers）创建的；macOS libdispatch / libsystem 等系统辅助
-    // 线程在 fork 时自己会 reset（macOS PHP CLI 启动时就有 3 个），不构成
-    // 真正风险——若默认 strict，业务在 macOS 上连 ensureWorker 都过不去。
-    //
-    // 所以策略反过来：
-    //   - 默认仅记 warn 不阻塞（兼顾 macOS 现实 + 给 ops 留可观测）
-    //   - 业务/CI 想要严格态：设 `HI_KAFKA_STRICT_FORK=1`，多线程时直接 bail
-    //     强迫业务"在 Swoole reactor / SDK 起 thread 前调 ensureWorker"
+    // 默认允许并依赖「就绪超时即 SIGKILL」把最坏情况限定为一次有界失败——worker
+    // 崩溃后的惰性恢复往往发生在已有线程池的 Swoole worker 里，拒绝 fork 会让 Kafka
+    // 长期不可用。`HI_KAFKA_STRICT_FORK=1` 时严格拒绝。
     let n_threads = current_thread_count();
     if n_threads > 1 {
         let strict = std::env::var("HI_KAFKA_STRICT_FORK")
@@ -161,32 +202,65 @@ fn spawn_worker_inproc(cfg: &SpawnConfig) -> Result<(), SpawnError> {
         }
         tracing::warn!(
             threads = n_threads,
-            "forking from multi-threaded process; child may deadlock on inherited mutexes \
-             from non-system threads (Sentry / OTel / pthreads). \
-             Set HI_KAFKA_STRICT_FORK=1 to refuse fork in this state."
+            "forking worker from a multi-threaded process; a worker that inherits a held lock \
+             will be killed after the ready timeout. Call ensureWorker() before starting \
+             reactors/threads to avoid this."
         );
     }
 
+    // fork 之后的子进程不做任何分配：所有需要的数据在这里准备好。
     let child_config = cfg.to_child_config();
-
-    // fork() 之前不持锁、不持文件 handle（除了 lock_file 由调用方持有）
-    // 子进程会继承 lock_file fd，但我们不 close 它——父端 drop 后锁会自动释放
-    let pid = unsafe { libc::fork() };
-
-    if pid < 0 {
+    let mut pipe_fds = [0 as libc::c_int; 2];
+    if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
         return Err(SpawnError::ForkFailed(std::io::Error::last_os_error()));
     }
+    let [read_fd, write_fd] = pipe_fds;
 
-    if pid == 0 {
-        // === 子进程 ===
-        // 进入 worker，永不返回
-        unsafe { worker_entry::run_in_child(child_config) };
-        // unreachable
+    let intermediate = unsafe { libc::fork() };
+    if intermediate < 0 {
+        let error = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
+        return Err(SpawnError::ForkFailed(error));
+    }
+
+    if intermediate == 0 {
+        // === 中间进程：只允许 async-signal-safe 调用 ===
+        unsafe {
+            libc::close(read_fd);
+            libc::setsid();
+            let worker = libc::fork();
+            if worker == 0 {
+                libc::close(write_fd);
+                // 进入 worker，永不返回
+                worker_entry::run_in_child(child_config);
+            }
+            let bytes = worker.to_ne_bytes();
+            libc::write(write_fd, bytes.as_ptr().cast(), bytes.len());
+            libc::_exit(if worker > 0 { 0 } else { 1 });
+        }
     }
 
     // === 父进程 ===
-    // 不 wait —— 子进程独立活下去，等下面 wait_for_socket 检测就绪
-    Ok(())
+    unsafe { libc::close(write_fd) };
+    let mut status = 0;
+    while unsafe { libc::waitpid(intermediate, &mut status, 0) } < 0
+        && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+    {}
+    let mut bytes = [0u8; std::mem::size_of::<libc::pid_t>()];
+    let mut file = unsafe { <File as std::os::fd::FromRawFd>::from_raw_fd(read_fd) };
+    let worker = match file.read_exact(&mut bytes) {
+        Ok(()) => libc::pid_t::from_ne_bytes(bytes),
+        Err(_) => 0,
+    };
+    if worker < 0 {
+        return Err(SpawnError::ForkFailed(std::io::Error::other(
+            "intermediate process failed to fork the worker",
+        )));
+    }
+    Ok(worker)
 }
 
 /// 当前进程的线程数。各 OS 拿数据来源不同：

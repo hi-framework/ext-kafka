@@ -39,6 +39,8 @@ ALL_TESTS=(
     consumer-offset-v2
     consumer-rebalance-v2
     consumer-cooperative-v2
+    worker-spawn-v2
+    client-fork-v2
     panic-recovery
     recovery
 )

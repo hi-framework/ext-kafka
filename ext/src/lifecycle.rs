@@ -17,9 +17,8 @@
 
 use crate::pool;
 use crate::protocol;
-use hi_kafka_proto::HEADER_LEN;
 use std::collections::BTreeSet;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
@@ -71,33 +70,10 @@ fn cleanup_socket(socket: &str) {
     // drop(stream)：连接立即关闭 → worker 端 EOF → 触发「最后一个连接关闭」判定。
 }
 
-/// 直连 socket 并完成 HELLO 握手。任一步失败返回 None（视作 worker 不可用）。
-/// **不** spawn、**不** 复用池连接（池连接随后会被进程退出关掉，这里要一个独立、
-/// 发完即关的连接，使 worker 能干净捕捉到它的关闭）。
+/// 直连 socket 并完成 HELLO 握手（绝不 spawn、不复用池连接）。这里要一个独立、
+/// 发完即关的连接，使 worker 能干净捕捉到它的关闭。
 fn connect_and_handshake(socket: &str) -> Option<UnixStream> {
-    let mut stream = UnixStream::connect(socket).ok()?;
-    stream.set_read_timeout(Some(IO_TIMEOUT)).ok()?;
-    stream.set_write_timeout(Some(IO_TIMEOUT)).ok()?;
-
-    let hello = protocol::build_hello_frame().ok()?;
-    write_all(&mut stream, &hello).ok()?;
-
-    // 读 HELLO RESP：13B header + 小 payload。
-    let mut header = [0u8; HEADER_LEN];
-    stream.read_exact(&mut header).ok()?;
-    let payload_len = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
-    // 防御：HELLO RESP payload 极小（1B major）。异常大 → 协议错乱，放弃。
-    if payload_len > 64 {
-        return None;
-    }
-    let mut payload = vec![0u8; payload_len];
-    stream.read_exact(&mut payload).ok()?;
-
-    let mut full = Vec::with_capacity(HEADER_LEN + payload_len);
-    full.extend_from_slice(&header);
-    full.extend_from_slice(&payload);
-    protocol::parse_hello_resp(&full).ok()?;
-    Some(stream)
+    crate::spawn::handshake(Path::new(socket), IO_TIMEOUT)
 }
 
 fn write_all(stream: &mut UnixStream, buf: &[u8]) -> std::io::Result<()> {
