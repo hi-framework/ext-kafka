@@ -140,7 +140,6 @@ async fn run_server(config: ChildConfig) -> anyhow::Result<()> {
     };
 
     let pid_file = pid_file_for(&config.socket);
-    let _ = write_pid_file(&pid_file);
 
     let registry = ClusterRegistry::new();
 
@@ -178,6 +177,9 @@ async fn run_server(config: ChildConfig) -> anyhow::Result<()> {
         idle_timeout,
     )
     .await?;
+    // 只有 bind 成功后才写 pid 文件：bind 失败的 worker（例如路径上已有 worker 在服务、
+    // 只是暂时无响应）若先写入，会把仍在服务的 worker 的 pid 覆盖成一个已退出的进程。
+    let _ = write_pid_file(&pid_file);
 
     // P0 #1：同 main.rs，信号触发 shutdown，server.run 自己 drain。
     let shutdown_for_sig = shutdown.clone();

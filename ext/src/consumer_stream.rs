@@ -203,6 +203,9 @@ struct State {
     pending_ack_wire_size: u64,
     read_buffer: BytesMut,
     closed: bool,
+    /// 控制帧传输失败后连接已被放弃（可能有晚到响应或半帧）。下一次操作必须先重连；
+    /// macOS 上对已 shutdown 的 socket 调 setsockopt 会返回 EINVAL。
+    broken: bool,
 }
 
 #[php_class]
@@ -257,6 +260,7 @@ impl ConsumerStream {
                 pending_ack_wire_size: 0,
                 read_buffer: BytesMut::new(),
                 closed: false,
+                broken: false,
             }),
         })
     }
@@ -280,10 +284,13 @@ impl ConsumerStream {
             ));
         }
         let timeout = Duration::from_millis(timeoutMs.unwrap_or(30_000).max(1) as u64);
-        state
-            .stream
-            .set_read_timeout(Some(timeout))
-            .map_err(io_php)?;
+        if state.broken || state.stream.set_read_timeout(Some(timeout)).is_err() {
+            reconnect(&mut state, timeout).map_err(crate::ipc_err_to_php)?;
+            state
+                .stream
+                .set_read_timeout(Some(timeout))
+                .map_err(io_php)?;
+        }
         loop {
             if state.pending_ack_delivery_id.is_some() {
                 let message_credit = state.max_message_credit;
@@ -367,9 +374,20 @@ impl ConsumerStream {
                     continue;
                 }
                 FrameType::Error => {
-                    return Err(crate::ipc_err_to_php(
-                        decode_worker_error(&payload).map_err(crate::ipc_err_to_php)?,
-                    ))
+                    let error = decode_worker_error(&payload).map_err(crate::ipc_err_to_php)?;
+                    // 与协程 stream 一致：可重试的 worker 错误（例如 rebalance 与 ACK 交错
+                    // 导致的 epoch 过期）在新连接上恢复，未 ACK 的消息照常重投。
+                    if matches!(
+                        error,
+                        ipc::IpcError::Worker {
+                            retryable: true,
+                            ..
+                        }
+                    ) {
+                        reconnect(&mut state, timeout).map_err(crate::ipc_err_to_php)?;
+                        continue;
+                    }
+                    return Err(crate::ipc_err_to_php(error));
                 }
                 FrameType::ConsumeClose => {
                     // worker 进入 drain（滚动发布、空闲自退、SIGTERM）。这不是业务关闭：
@@ -435,17 +453,20 @@ impl ConsumerStream {
             .lock()
             .map_err(|_| PhpException::default("consumer stream lock poisoned".into()))?;
         ensure_open(&state)?;
-        state
-            .stream
-            .set_read_timeout(Some(Duration::from_millis(
-                timeoutMs.unwrap_or(5000).max(1) as u64,
-            )))
-            .map_err(io_php)?;
+        let timeout = Duration::from_millis(timeoutMs.unwrap_or(5000).max(1) as u64);
+        if state.broken || state.stream.set_read_timeout(Some(timeout)).is_err() {
+            reconnect(&mut state, timeout).map_err(crate::ipc_err_to_php)?;
+            state
+                .stream
+                .set_read_timeout(Some(timeout))
+                .map_err(io_php)?;
+        }
         // 控制帧的传输失败（含读超时）之后，这条连接上可能还有晚到的响应，或只写出了
         // 半帧。关闭连接，让下一次 next() 经 resume 在新连接上继续，绝不复用失配的字节流。
         let abandon = |state: &mut State, error: ipc::IpcError| {
             if matches!(error, ipc::IpcError::Io(_)) {
                 let _ = state.stream.shutdown(Shutdown::Both);
+                state.broken = true;
             }
             crate::ipc_err_to_php(error)
         };
@@ -923,6 +944,7 @@ fn reopen(state: &mut State, timeout: Duration) -> Result<(), ipc::IpcError> {
 
 fn install_ready(state: &mut State, stream: UnixStream, ready: ConsumeReady) {
     state.stream = stream;
+    state.broken = false;
     state.subscription_id = ready.subscription_id;
     state.epoch = ready.subscription_epoch;
     state.resume_token = ready.resume_token;

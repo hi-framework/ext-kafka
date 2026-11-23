@@ -151,9 +151,11 @@ impl ConsumerError {
             Self::InvalidResumeToken | Self::ResumeExpired => {
                 response(ErrorKind::SubscriptionNotFound)
             }
+            // epoch 过期是 rebalance / 重连与客户端控制帧交错的正常竞态：请求没有生效，
+            // watermark 保留在 worker 中，客户端读到新 epoch 后重试即可。
             Self::StaleEpoch { .. }
             | Self::State(StreamStateError::Watermark(WatermarkError::StaleEpoch { .. })) => {
-                response(ErrorKind::StaleEpoch)
+                retryable(ErrorKind::StaleEpoch)
             }
             Self::ActorStopped => retryable(ErrorKind::WorkerUnavailable),
             Self::RecordTooLarge(_)

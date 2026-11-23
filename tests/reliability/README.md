@@ -54,6 +54,7 @@ php -n tests/reliability/soak.php --out=/tmp/soak-24h --ext=... \
 | 已确认消息全部被消费 | missing = 0 |
 | 无损坏 | corrupted = 0 |
 | 重复有界 | ≤ (commit_every + rate) × 扰动次数 |
+| 无非预期进程崩溃（客户端须在故障中自愈） | 0（consumer-kill 的 SIGKILL 除外） |
 | 所有故障后恢复 | 0 个未恢复 |
 | 恢复时间最大值 | ≤ 30s |
 | 故障窗口外的消费停顿 | ≤ 30s |

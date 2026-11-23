@@ -8,6 +8,7 @@ declare(strict_types=1);
  * 判据与默认阈值（可用参数覆盖，按业务 SLA 调整）：
  * - missing == 0、corrupted == 0                         不丢、不损坏
  * - duplicates <= (commit_every + rate) × 扰动次数        重复只来自未提交窗口
+ * - 非故障注入导致的进程崩溃 == 0（consumer-kill 的 SIGKILL 不计入）
  * - 故障后生产/消费恢复时间最大值 <= --max-recovery=30s
  * - 故障窗口之外的消费停顿 <= --max-stall=30s
  * - worker RSS 峰值 <= --max-worker-rss-mib=512
@@ -167,6 +168,13 @@ if (null !== $longest && count($longest['rows']) >= 3) {
     ];
 }
 
+// ---------------------------------------------------------------- crashes
+// 进程自己退出（非零退出码）或被 SIGKILL 以外的信号终止，都意味着客户端没能在故障中
+// 自愈，只能依赖进程管理器重启。consumer-kill 注入的 SIGKILL 是预期内的。
+$crashes = array_values(array_filter($events, static fn ($e) => 'process_exit' === ($e['type'] ?? null)
+    && ! ($e['signaled'] && SIGKILL === $e['termsig'])
+    && 0 !== $e['exitcode']));
+
 // ---------------------------------------------------------------- verdict
 $disruptions = count(array_filter($faults, static fn ($f) => ! isset($f['skipped'])))
     + array_sum(array_map(static fn ($n) => (int) $n, $restarts));
@@ -176,6 +184,7 @@ $criteria = [
     ['name' => '不丢消息（acked 均被消费）', 'value' => $ledger['missing'], 'limit' => '0', 'pass' => 0 === $ledger['missing']],
     ['name' => '无损坏（crc 校验）', 'value' => $ledger['corrupted'], 'limit' => '0', 'pass' => 0 === $ledger['corrupted']],
     ['name' => '重复有界', 'value' => $ledger['duplicates'], 'limit' => "≤ {$dupBound}（(commit_every + rate) × {$disruptions} 次扰动）", 'pass' => $ledger['duplicates'] <= $dupBound],
+    ['name' => '无非预期进程崩溃', 'value' => count($crashes), 'limit' => '0（consumer-kill 的 SIGKILL 除外）', 'pass' => [] === $crashes],
     ['name' => '故障后均恢复', 'value' => $unrecovered, 'limit' => '0 个未恢复', 'pass' => 0 === $unrecovered],
     ['name' => '恢复时间最大值', 'value' => round($maxRecovery, 2) . 's', 'limit' => "≤ {$limits['max_recovery']}s", 'pass' => $maxRecovery <= $limits['max_recovery']],
     ['name' => '故障窗口外的消费停顿', 'value' => round($maxStall, 2) . 's' . (null === $stallAt ? '' : " @{$stallAt}s"), 'limit' => "≤ {$limits['max_stall']}s", 'pass' => $maxStall <= $limits['max_stall']],
@@ -204,6 +213,7 @@ $report = [
     'ledger' => $ledger,
     'recoveries' => $recoveries,
     'process_restarts' => $restarts,
+    'crashes' => $crashes,
     'errors' => $errorKinds,
     'resources' => ['worker_rss_max_mib' => round($workerRssMax / 1024, 1), 'slope' => $slopeResult, 'worker_processes' => count($segments)],
 ];
