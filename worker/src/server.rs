@@ -162,6 +162,10 @@ impl Server {
                         ?drain_timeout,
                         "server: drain signaled, waiting for in-flight connection tasks"
                     );
+                    // 先关闭监听：draining 的 worker 不再 accept，连接只会卡在 backlog 里
+                    // 直到超时；而新 worker 在 bind 时会把仍在监听的 socket 视为「已有
+                    // worker」而拒绝启动。关闭后客户端立即收到 ECONNREFUSED 并拉起新 worker。
+                    drop(self.listener);
                     drain_tasks(&mut tasks, drain_timeout).await;
                     info!("server: drain complete");
                     return Ok(());

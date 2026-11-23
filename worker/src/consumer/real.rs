@@ -101,10 +101,19 @@ fn partitions(tpl: &TopicPartitionList) -> Vec<(String, i32)> {
         .collect()
 }
 
+/// 单次 commit 的等待上限，低于客户端默认的 5s 控制超时：客户端拿到的是 worker 的
+/// 结构化 TIMEOUT，而不是本地读超时后失配的连接。
+const COMMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+
+type CommitTask = tokio::task::JoinHandle<Result<(), KafkaError>>;
+
 struct KafkaSource {
     consumer: Arc<StreamConsumer<KafkaContext>>,
     notices: Arc<Mutex<Vec<SourceNotice>>>,
     notice_signal: Arc<tokio::sync::Notify>,
+    /// 超时后仍在 librdkafka 中阻塞的同步 commit。coordinator 不可用时同步 commit 会
+    /// 阻塞到 socket 超时；同一时刻只保留一个，避免阻塞线程随重试堆积。
+    pending_commit: Option<CommitTask>,
 }
 
 impl KafkaSource {
@@ -191,6 +200,7 @@ impl ConsumerSourceFactory for KafkaSourceFactory {
             consumer: Arc::new(consumer),
             notices,
             notice_signal,
+            pending_commit: None,
         }))
     }
 }
@@ -386,13 +396,34 @@ impl ConsumerSource for KafkaSource {
             )
             .map_err(|e| ConsumerError::Backend(anyhow::anyhow!(e)))?;
         }
-        let consumer = self.consumer.clone();
-        tokio::task::spawn_blocking(move || consumer.commit(&tpl, CommitMode::Sync))
-            .await
-            .map_err(|join| ConsumerError::Backend(anyhow::anyhow!(join)))?
-            .map_err(|error| {
-                ConsumerError::Backend(anyhow::Error::new(commit_error_to_worker(&error)))
-            })
+        let mut task = match self.pending_commit.take() {
+            // 上一次超时的 commit 还没返回：不再叠加新的阻塞调用，先等它。
+            Some(previous) if !previous.is_finished() => previous,
+            _ => {
+                let consumer = self.consumer.clone();
+                tokio::task::spawn_blocking(move || consumer.commit(&tpl, CommitMode::Sync))
+            }
+        };
+        match tokio::time::timeout(COMMIT_TIMEOUT, &mut task).await {
+            Ok(joined) => joined
+                .map_err(|join| ConsumerError::Backend(anyhow::anyhow!(join)))?
+                .map_err(|error| {
+                    ConsumerError::Backend(anyhow::Error::new(commit_error_to_worker(&error)))
+                }),
+            Err(_) => {
+                self.pending_commit = Some(task);
+                Err(ConsumerError::Backend(anyhow::Error::new(WorkerError {
+                    kind: ErrorKind::Timeout,
+                    retryable: true,
+                    outcome: OperationOutcome::Unknown,
+                    native_code: 0,
+                    message: format!(
+                        "commit did not complete within {}s (coordinator unavailable?)",
+                        COMMIT_TIMEOUT.as_secs()
+                    ),
+                })))
+            }
+        }
     }
 
     async fn seek(&mut self, offsets: &[(PartitionKey, i64)]) -> Result<(), ConsumerError> {
@@ -453,6 +484,7 @@ fn is_recoverable_consumer_code(code: &RDKafkaErrorCode) -> bool {
             | CoordinatorLoadInProgress
             | CoordinatorNotAvailable
             | NotCoordinator
+            | WaitingForCoordinator
             | RebalanceInProgress
     )
 }
@@ -497,6 +529,7 @@ fn commit_error_to_worker(error: &KafkaError) -> WorkerError {
             CoordinatorNotAvailable
             | NotCoordinator
             | CoordinatorLoadInProgress
+            | WaitingForCoordinator
             | BrokerTransportFailure
             | AllBrokersDown
             | NetworkException,
@@ -578,6 +611,9 @@ mod tests {
         let timeout = KafkaError::ConsumerCommit(RDKafkaErrorCode::RequestTimedOut);
         let response = commit_error_to_worker(&timeout).to_error_resp();
         assert_eq!(response.outcome, OperationOutcome::Unknown);
+
+        let waiting = KafkaError::ConsumerCommit(RDKafkaErrorCode::WaitingForCoordinator);
+        assert!(commit_error_to_worker(&waiting).to_error_resp().retryable);
 
         let fatal = KafkaError::ConsumerCommit(RDKafkaErrorCode::OffsetMetadataTooLarge);
         assert!(!commit_error_to_worker(&fatal).to_error_resp().retryable);

@@ -145,9 +145,13 @@ impl ConsumerError {
                 retryable(ErrorKind::CreditExhausted)
             }
             Self::InvalidArgument(_) => response(ErrorKind::InvalidArgument),
+            // 无法 resume 的订阅一律按「不存在」处理，客户端直接重新 open：resume 窗口
+            // 已过，或 token 不匹配（例如新 worker 的 subscription id 恰好与旧 id 相同）。
+            // 映射为 STALE_EPOCH 会让客户端一直重试到 grace 结束才失败。
+            Self::InvalidResumeToken | Self::ResumeExpired => {
+                response(ErrorKind::SubscriptionNotFound)
+            }
             Self::StaleEpoch { .. }
-            | Self::InvalidResumeToken
-            | Self::ResumeExpired
             | Self::State(StreamStateError::Watermark(WatermarkError::StaleEpoch { .. })) => {
                 response(ErrorKind::StaleEpoch)
             }
@@ -430,7 +434,9 @@ impl ConsumerManager {
         Arc::new(Self {
             factory,
             subscriptions: Arc::new(Mutex::new(HashMap::new())),
-            next_id: AtomicU64::new(1),
+            // 随机起点：worker 重启后 id 不会与旧 worker 的订阅重合，客户端拿旧 id 来
+            // resume 时得到 NOT_FOUND，而不是撞上另一个消费者的新订阅。
+            next_id: AtomicU64::new(initial_subscription_id()),
             subscription_slots: Arc::new(Semaphore::new(
                 env_usize("HI_KAFKA_MAX_SUBSCRIPTIONS", DEFAULT_MAX_SUBSCRIPTIONS).max(1),
             )),
@@ -1359,6 +1365,16 @@ fn validate_open(request: &ConsumeOpen) -> Result<(), ConsumerError> {
         ));
     }
     Ok(())
+}
+
+fn initial_subscription_id() -> u64 {
+    let mut bytes = [0u8; 8];
+    // 取不到随机数时退回 1：id 碰撞只会让 resume 失败后重新 open，不影响正确性。
+    if getrandom::fill(&mut bytes).is_err() {
+        return 1;
+    }
+    // 留出足够余量，保证 fetch_add 不会溢出。
+    (u64::from_ne_bytes(bytes) >> 2).max(1)
 }
 
 fn random_token() -> Result<ResumeToken, ConsumerError> {

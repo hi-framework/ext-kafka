@@ -372,10 +372,10 @@ impl ConsumerStream {
                     ))
                 }
                 FrameType::ConsumeClose => {
-                    state.closed = true;
-                    return Err(PhpException::default(
-                        "consumer stream closed by worker".into(),
-                    ));
+                    // worker 进入 drain（滚动发布、空闲自退、SIGTERM）。这不是业务关闭：
+                    // 在新 worker 上恢复或重新打开订阅，未 ACK 的消息照常重投。
+                    reconnect(&mut state, timeout).map_err(crate::ipc_err_to_php)?;
+                    continue;
                 }
                 other => {
                     return Err(PhpException::default(format!(
@@ -441,22 +441,36 @@ impl ConsumerStream {
                 timeoutMs.unwrap_or(5000).max(1) as u64,
             )))
             .map_err(io_php)?;
-        flush_pending_ack_for_control(&mut state).map_err(crate::ipc_err_to_php)?;
+        // 控制帧的传输失败（含读超时）之后，这条连接上可能还有晚到的响应，或只写出了
+        // 半帧。关闭连接，让下一次 next() 经 resume 在新连接上继续，绝不复用失配的字节流。
+        let abandon = |state: &mut State, error: ipc::IpcError| {
+            if matches!(error, ipc::IpcError::Io(_)) {
+                let _ = state.stream.shutdown(Shutdown::Both);
+            }
+            crate::ipc_err_to_php(error)
+        };
+        if let Err(error) = flush_pending_ack_for_control(&mut state) {
+            return Err(abandon(&mut state, error));
+        }
         let cid = ipc::next_cid();
         let commit = ConsumeCommit {
             subscription_id: state.subscription_id,
             subscription_epoch: state.epoch,
         };
-        send_payload(&mut state.stream, FrameType::ConsumeCommit, cid, |b| {
+        if let Err(error) = send_payload(&mut state.stream, FrameType::ConsumeCommit, cid, |b| {
             commit.encode(b)
-        })
-        .map_err(crate::ipc_err_to_php)?;
+        }) {
+            return Err(abandon(&mut state, error));
+        }
         loop {
-            let (kind, got_cid, payload) = {
+            let read = {
                 let state = &mut *state;
                 read_frame_buffered(&mut state.stream, &mut state.read_buffer)
-            }
-            .map_err(crate::ipc_err_to_php)?;
+            };
+            let (kind, got_cid, payload) = match read {
+                Ok(frame) => frame,
+                Err(error) => return Err(abandon(&mut state, error)),
+            };
             match kind {
                 FrameType::ConsumeCommitted if got_cid == cid => {
                     ConsumeCommitted::decode(&payload)
@@ -889,7 +903,20 @@ fn reopen(state: &mut State, timeout: Duration) -> Result<(), ipc::IpcError> {
     crate::worker_health::invalidate(&state.socket);
     ipc::ensure(&state.socket)?;
     let mut stream = connect_hello(&state.socket, timeout)?;
-    let ready = open_stream(&mut stream, &state.open)?;
+    let ready = match open_stream(&mut stream, &state.open) {
+        Ok(ready) => ready,
+        // worker 由其它进程重启：本进程的集群注册不在新 worker 中，重放后重开一次。
+        // worker 拒绝 ConsumeOpen 后会关闭这条连接，必须新建连接。
+        Err(ipc::IpcError::Worker {
+            kind: ErrorKind::ClusterNotRegistered,
+            ..
+        }) => {
+            ipc::replay(&state.socket)?;
+            stream = connect_hello(&state.socket, timeout)?;
+            open_stream(&mut stream, &state.open)?
+        }
+        Err(error) => return Err(error),
+    };
     install_ready(state, stream, ready);
     Ok(())
 }

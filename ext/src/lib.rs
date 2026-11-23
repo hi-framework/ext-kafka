@@ -57,31 +57,60 @@ pub use consumer_stream::{ConsumerRecord, ConsumerStream};
 /// 分类以公开属性暴露：`$e->kind` / `$e->kind_name` / `$e->retryable` / `$e->native_code`
 /// （`$e->getCode()` 亦 = kind）。
 pub(crate) fn ipc_err_to_php(e: ipc::IpcError) -> PhpException {
-    if let ipc::IpcError::Worker {
-        kind,
-        retryable,
-        outcome,
-        native_code,
-        message,
-    } = &e
-    {
-        if let Some(zv) = kafka_exception::build_zval(
+    use hi_kafka_proto::{ErrorKind, OperationOutcome};
+    use std::io::ErrorKind as Io;
+
+    // 传输层故障同样以结构化 KafkaException 抛出，业务可以按 retryable 统一处理；
+    // 此前它们是普通 Exception，「worker 重启 / 读超时」无法与编程错误区分。
+    let (kind, retryable, outcome, native_code, message) = match &e {
+        ipc::IpcError::Worker {
+            kind,
+            retryable,
+            outcome,
+            native_code,
             message,
-            kind.as_u16() as i64,
-            kind.as_str(),
-            *retryable,
-            outcome.as_str(),
-            *native_code as i64,
-        ) {
-            // set_object 会让 throw 走 throw_object(zv)，所以这里的 ce 仅作占位。
-            let mut ph = PhpException::new(
-                message.clone(),
-                kind.as_u16() as i32,
-                ext_php_rs::zend::ce::exception(),
-            );
-            ph.set_object(Some(zv));
-            return ph;
-        }
+        } => (*kind, *retryable, *outcome, *native_code, message.clone()),
+        ipc::IpcError::Io(io) if matches!(io.kind(), Io::TimedOut | Io::WouldBlock) => (
+            ErrorKind::Timeout,
+            true,
+            OperationOutcome::Unknown,
+            0,
+            e.to_string(),
+        ),
+        // 请求可能已发出：结果未知。
+        ipc::IpcError::Io(_) => (
+            ErrorKind::WorkerUnavailable,
+            true,
+            OperationOutcome::Unknown,
+            0,
+            e.to_string(),
+        ),
+        // 拿不到连接或 worker 起不来：请求一定没有发出。
+        ipc::IpcError::Pool(_) | ipc::IpcError::EnsureWorker(_) => (
+            ErrorKind::WorkerUnavailable,
+            true,
+            OperationOutcome::NotApplied,
+            0,
+            e.to_string(),
+        ),
+        _ => return PhpException::default(e.to_string()),
+    };
+    if let Some(zv) = kafka_exception::build_zval(
+        &message,
+        kind.as_u16() as i64,
+        kind.as_str(),
+        retryable,
+        outcome.as_str(),
+        native_code as i64,
+    ) {
+        // set_object 会让 throw 走 throw_object(zv)，所以这里的 ce 仅作占位。
+        let mut ph = PhpException::new(
+            message,
+            kind.as_u16() as i32,
+            ext_php_rs::zend::ce::exception(),
+        );
+        ph.set_object(Some(zv));
+        return ph;
     }
     PhpException::default(e.to_string())
 }
