@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Mutex, OwnedSemaphorePermit, Semaphore};
-use tracing::warn;
+use tracing::{debug, warn};
 
 #[cfg(feature = "kafka")]
 mod real;
@@ -88,7 +88,9 @@ pub(crate) trait ConsumerSource: Send {
     fn take_notice(&mut self) -> Option<SourceNotice>;
     async fn commit(&mut self, offsets: &[(PartitionKey, i64)]) -> Result<(), ConsumerError>;
     async fn seek(&mut self, offsets: &[(PartitionKey, i64)]) -> Result<(), ConsumerError>;
+    /// 空列表表示 librdkafka 当前的完整 assignment。
     async fn pause(&mut self, partitions: &[(String, i32)]) -> Result<(), ConsumerError>;
+    /// 空列表表示 librdkafka 当前的完整 assignment。
     async fn resume(&mut self, partitions: &[(String, i32)]) -> Result<(), ConsumerError>;
 }
 
@@ -1030,13 +1032,16 @@ impl SubscriptionActor {
     }
 
     async fn handle_notice(&mut self, notice: SourceNotice) -> Result<(), ConsumerError> {
+        debug!(subscription_id = self.id, epoch = self.core.epoch(), ?notice, assignment = ?self.assignment, "rebalance notice");
         let (kind, partitions) = match notice {
             SourceNotice::Assign(p) => {
                 Metrics::inc(&self.metrics.consumer_rebalance_assign_total);
-                self.assignment = p
-                    .iter()
-                    .map(|(topic, partition)| PartitionKey::new(topic.clone(), *partition))
-                    .collect();
+                // cooperative 协议下 Assign 只携带增量分区，必须合并而不是覆盖；
+                // eager 协议的 Revoke 总是先清空整个 assignment，合并结果与覆盖相同。
+                self.assignment.extend(
+                    p.iter()
+                        .map(|(topic, partition)| PartitionKey::new(topic.clone(), *partition)),
+                );
                 let paused = if self.backpressure_paused {
                     p.clone()
                 } else {
@@ -1138,14 +1143,25 @@ impl SubscriptionActor {
             if !self.backpressure_paused {
                 return Ok(());
             }
-            let resumable = self
-                .assignment
-                .iter()
-                .filter(|partition| !self.user_paused.contains(*partition))
-                .map(|partition| (partition.topic.clone(), partition.partition))
-                .collect::<Vec<_>>();
-            if !resumable.is_empty() {
-                self.source.resume(&resumable).await?;
+            // backpressure pause 作用于 librdkafka 的真实 assignment（空列表）；没有用户
+            // 暂停时也按真实 assignment 恢复，不依赖 actor 视图与 librdkafka 完全同步。
+            if self.user_paused.is_empty() {
+                debug!(
+                    subscription_id = self.id,
+                    "backpressure resume (full assignment)"
+                );
+                self.source.resume(&[]).await?;
+            } else {
+                let resumable = self
+                    .assignment
+                    .iter()
+                    .filter(|partition| !self.user_paused.contains(*partition))
+                    .map(|partition| (partition.topic.clone(), partition.partition))
+                    .collect::<Vec<_>>();
+                debug!(subscription_id = self.id, ?resumable, "backpressure resume");
+                if !resumable.is_empty() {
+                    self.source.resume(&resumable).await?;
+                }
             }
             self.backpressure_paused = false;
             return Ok(());
@@ -1160,6 +1176,7 @@ impl SubscriptionActor {
         if !immediate && started.elapsed() < BACKPRESSURE_PAUSE_DEBOUNCE {
             return Ok(());
         }
+        debug!(subscription_id = self.id, "backpressure pause");
         self.source.pause(&[]).await?;
         self.backpressure_paused = true;
         Ok(())
@@ -1371,4 +1388,261 @@ fn env_usize(key: &str, default: usize) -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod actor_tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    enum Script {
+        Record(SourceRecord),
+        Notices(Vec<SourceNotice>),
+    }
+
+    #[derive(Default)]
+    struct Calls {
+        paused: Vec<Vec<(String, i32)>>,
+        resumed: Vec<Vec<(String, i32)>>,
+    }
+
+    /// 由测试通过 channel 逐条喂入 record / rebalance notice 的 source，记录所有
+    /// librdkafka 控制调用。`pause(&[])` 记为空列表，语义同真实实现的「全部 assignment」。
+    struct ScriptedSource {
+        script: mpsc::UnboundedReceiver<Script>,
+        calls: Arc<StdMutex<Calls>>,
+    }
+
+    #[async_trait]
+    impl ConsumerSource for ScriptedSource {
+        async fn next_record(
+            &mut self,
+            budget: &GlobalBudget,
+        ) -> Result<SourceRead, ConsumerError> {
+            match self.script.recv().await {
+                Some(Script::Record(record)) => {
+                    let message = budget.acquire_message()?;
+                    let permit = budget.acquire_bytes(message, record.wire_size())?;
+                    Ok(SourceRead::Record(record, permit))
+                }
+                Some(Script::Notices(notices)) => Ok(SourceRead::RebalancePending {
+                    notices,
+                    record: None,
+                    blocked: None,
+                }),
+                None => std::future::pending().await,
+            }
+        }
+        fn take_notice(&mut self) -> Option<SourceNotice> {
+            None
+        }
+        async fn commit(&mut self, _offsets: &[(PartitionKey, i64)]) -> Result<(), ConsumerError> {
+            Ok(())
+        }
+        async fn seek(&mut self, _offsets: &[(PartitionKey, i64)]) -> Result<(), ConsumerError> {
+            Ok(())
+        }
+        async fn pause(&mut self, partitions: &[(String, i32)]) -> Result<(), ConsumerError> {
+            self.calls.lock().unwrap().paused.push(partitions.to_vec());
+            Ok(())
+        }
+        async fn resume(&mut self, partitions: &[(String, i32)]) -> Result<(), ConsumerError> {
+            self.calls.lock().unwrap().resumed.push(partitions.to_vec());
+            Ok(())
+        }
+    }
+
+    struct ScriptedFactory(StdMutex<Option<ScriptedSource>>);
+
+    #[async_trait]
+    impl ConsumerSourceFactory for ScriptedFactory {
+        async fn create(
+            &self,
+            _request: &ConsumeOpen,
+        ) -> Result<Box<dyn ConsumerSource>, ConsumerError> {
+            Ok(Box::new(
+                self.0.lock().unwrap().take().expect("single subscription"),
+            ))
+        }
+    }
+
+    struct Harness {
+        script: mpsc::UnboundedSender<Script>,
+        calls: Arc<StdMutex<Calls>>,
+        outbound: mpsc::Receiver<OutboundFrame>,
+        session: ConsumerSession,
+        ready: ConsumeReady,
+        _manager: ConsumerHandle,
+    }
+
+    async fn open() -> Harness {
+        let (script, receiver) = mpsc::unbounded_channel();
+        let calls = Arc::new(StdMutex::new(Calls::default()));
+        let factory = ScriptedFactory(StdMutex::new(Some(ScriptedSource {
+            script: receiver,
+            calls: calls.clone(),
+        })));
+        let manager = ConsumerManager::new(
+            Arc::new(factory),
+            crate::shutdown::ShutdownState::new(),
+            Metrics::new(),
+        );
+        let (tx, outbound) = mpsc::channel(manager.outbound_capacity());
+        let attachment = manager
+            .open(
+                ConsumeOpen {
+                    cluster: "c".into(),
+                    group_id: "g".into(),
+                    topics: vec!["t".into()],
+                    config: vec![],
+                    initial_message_credit: 1,
+                    initial_byte_credit: 1 << 20,
+                    max_in_flight_messages: 1,
+                    max_in_flight_bytes: 1 << 20,
+                    client_id: String::new(),
+                },
+                tx,
+            )
+            .await
+            .unwrap();
+        Harness {
+            script,
+            calls,
+            outbound,
+            session: attachment.session,
+            ready: attachment.ready,
+            _manager: manager,
+        }
+    }
+
+    fn record(partition: i32, offset: i64) -> SourceRecord {
+        SourceRecord {
+            topic: "t".into(),
+            partition,
+            offset,
+            timestamp_ms: 0,
+            key: None,
+            value: Some(Bytes::from_static(b"v")),
+            headers: vec![],
+        }
+    }
+
+    fn tp(partitions: &[i32]) -> Vec<(String, i32)> {
+        partitions.iter().map(|p| ("t".to_string(), *p)).collect()
+    }
+
+    async fn next_frame(harness: &mut Harness, kind: FrameType) -> OutboundFrame {
+        let frame = tokio::time::timeout(Duration::from_secs(2), harness.outbound.recv())
+            .await
+            .expect("frame deadline")
+            .expect("outbound open");
+        assert_eq!(frame.kind, kind);
+        frame
+    }
+
+    async fn wait_until(calls: &Arc<StdMutex<Calls>>, check: impl Fn(&Calls) -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !check(&calls.lock().unwrap()) {
+            assert!(tokio::time::Instant::now() < deadline, "condition deadline");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    async fn user_pause(h: &Harness, epoch: u64, partitions: &[i32]) {
+        h.session
+            .pause(ConsumerPartitions {
+                subscription_id: h.ready.subscription_id,
+                subscription_epoch: epoch,
+                partitions: tp(partitions),
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn deliver_and_ack(h: &mut Harness, partition: i32) {
+        h.script.send(Script::Record(record(partition, 7))).unwrap();
+        let frame = next_frame(h, FrameType::ConsumeMessage).await;
+        let message = ConsumeMessage::decode(&frame.payload).unwrap();
+        // 唯一的 credit 已用完：actor 去抖后对整个 assignment 做 backpressure pause。
+        wait_until(&h.calls, |c| c.paused.contains(&vec![])).await;
+        h.session
+            .ack(ConsumeAck {
+                subscription_id: h.ready.subscription_id,
+                subscription_epoch: message.subscription_epoch,
+                delivery_id: message.delivery_id,
+                message_credit: 1,
+                byte_credit: message.wire_size,
+            })
+            .await
+            .unwrap();
+        wait_until(&h.calls, |c| !c.resumed.is_empty()).await;
+    }
+
+    /// cooperative-sticky 下 Assign notice 只携带增量分区。actor 视图必须合并，否则
+    /// 存在用户暂停时按视图恢复会漏掉此前已拥有的分区，使其永久停在暂停状态。
+    #[tokio::test]
+    async fn incremental_assignment_is_merged_into_the_actor_view() {
+        let mut h = open().await;
+        h.script
+            .send(Script::Notices(vec![SourceNotice::Assign(tp(&[0, 1]))]))
+            .unwrap();
+        next_frame(&mut h, FrameType::RebalanceAssign).await;
+        h.script
+            .send(Script::Notices(vec![SourceNotice::Assign(tp(&[2]))]))
+            .unwrap();
+        next_frame(&mut h, FrameType::RebalanceAssign).await;
+        user_pause(&h, 1, &[1]).await;
+
+        deliver_and_ack(&mut h, 0).await;
+
+        assert_eq!(h.calls.lock().unwrap().resumed.last(), Some(&tp(&[0, 2])));
+    }
+
+    /// 部分 revoke 只移除被收回的分区，剩余分区在 backpressure 结束后照常恢复。
+    #[tokio::test]
+    async fn partial_revoke_keeps_retained_partitions_resumable() {
+        let mut h = open().await;
+        h.script
+            .send(Script::Notices(vec![
+                SourceNotice::Assign(tp(&[0, 1, 2])),
+                SourceNotice::Revoke(tp(&[1])),
+            ]))
+            .unwrap();
+        next_frame(&mut h, FrameType::RebalanceAssign).await;
+        let revoke = next_frame(&mut h, FrameType::RebalanceRevoke).await;
+        let epoch = RebalanceNotice::decode(&revoke.payload)
+            .unwrap()
+            .subscription_epoch;
+        user_pause(&h, epoch, &[2]).await;
+
+        // revoke 提升 epoch 后 credit 归零；补充 credit 触发 backpressure resume。
+        wait_until(&h.calls, |c| c.paused.contains(&vec![])).await;
+        h.session
+            .flow(FlowControl {
+                subscription_id: h.ready.subscription_id,
+                subscription_epoch: epoch,
+                message_credit: 1,
+                byte_credit: 1 << 20,
+            })
+            .await
+            .unwrap();
+        wait_until(&h.calls, |c| !c.resumed.is_empty()).await;
+
+        assert_eq!(h.calls.lock().unwrap().resumed.last(), Some(&tp(&[0])));
+    }
+
+    /// 没有用户暂停时按 librdkafka 的真实 assignment（空列表）恢复，与 pause 对称，
+    /// 不依赖 actor 视图与 librdkafka 完全同步。
+    #[tokio::test]
+    async fn backpressure_resume_without_user_pause_targets_full_assignment() {
+        let mut h = open().await;
+        h.script
+            .send(Script::Notices(vec![SourceNotice::Assign(tp(&[0, 1]))]))
+            .unwrap();
+        next_frame(&mut h, FrameType::RebalanceAssign).await;
+
+        deliver_and_ack(&mut h, 0).await;
+
+        assert_eq!(h.calls.lock().unwrap().resumed.last(), Some(&vec![]));
+    }
 }

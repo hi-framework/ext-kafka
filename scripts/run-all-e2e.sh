@@ -38,6 +38,7 @@ ALL_TESTS=(
     client-recovery-v2
     consumer-offset-v2
     consumer-rebalance-v2
+    consumer-cooperative-v2
     panic-recovery
     recovery
 )

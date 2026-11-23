@@ -33,6 +33,9 @@ impl KafkaSourceFactory {
 
 struct KafkaContext {
     notices: Arc<Mutex<Vec<SourceNotice>>>,
+    /// rebalance 回调在 `recv()` 内部执行；没有新消息时 `recv()` 不会返回。
+    /// 入队 notice 后唤醒 actor，保证 ownership 变化立即生效，而不是等到下一条消息。
+    notice_signal: Arc<tokio::sync::Notify>,
     oauth: OAuthTokenSlot,
     cluster: String,
 }
@@ -80,6 +83,8 @@ impl KafkaContext {
         } else if !matches!(notices.first(), Some(SourceNotice::Fatal(_))) {
             notices.push(notice);
         }
+        drop(notices);
+        self.notice_signal.notify_one();
     }
 }
 
@@ -93,6 +98,7 @@ fn partitions(tpl: &TopicPartitionList) -> Vec<(String, i32)> {
 struct KafkaSource {
     consumer: Arc<StreamConsumer<KafkaContext>>,
     notices: Arc<Mutex<Vec<SourceNotice>>>,
+    notice_signal: Arc<tokio::sync::Notify>,
 }
 
 impl KafkaSource {
@@ -128,8 +134,10 @@ impl ConsumerSourceFactory for KafkaSourceFactory {
             .await
             .ok_or_else(|| ConsumerError::ClusterNotRegistered(request.cluster.clone()))?;
         let notices = Arc::new(Mutex::new(Vec::new()));
+        let notice_signal = Arc::new(tokio::sync::Notify::new());
         let context = KafkaContext {
             notices: notices.clone(),
+            notice_signal: notice_signal.clone(),
             oauth,
             cluster: request.cluster.clone(),
         };
@@ -172,6 +180,7 @@ impl ConsumerSourceFactory for KafkaSourceFactory {
         Ok(Box::new(KafkaSource {
             consumer: Arc::new(consumer),
             notices,
+            notice_signal,
         }))
     }
 }
@@ -184,7 +193,24 @@ impl ConsumerSource for KafkaSource {
         // acquisition is try-only, so actor command cancellation cannot drop
         // a record after advancing the librdkafka fetch position.
         let message = loop {
-            match self.consumer.recv().await {
+            let received = tokio::select! {
+                biased;
+                // `recv()` 可安全取消：rebalance 回调已在其内部执行完毕并入队 notice，
+                // 取消只是放弃等待下一条消息。
+                _ = self.notice_signal.notified() => {
+                    let notices = self.drain_notices();
+                    if notices.is_empty() {
+                        continue;
+                    }
+                    return Ok(SourceRead::RebalancePending {
+                        notices,
+                        record: None,
+                        blocked: None,
+                    });
+                }
+                received = self.consumer.recv() => received,
+            };
+            match received {
                 Ok(message) => break message,
                 Err(error) if is_recoverable_consumer_error(&error) => {
                     warn!(
@@ -354,7 +380,9 @@ impl ConsumerSource for KafkaSource {
         tokio::task::spawn_blocking(move || consumer.commit(&tpl, CommitMode::Sync))
             .await
             .map_err(|join| ConsumerError::Backend(anyhow::anyhow!(join)))?
-            .map_err(|error| ConsumerError::Backend(anyhow::anyhow!(error)))
+            .map_err(|error| {
+                ConsumerError::Backend(anyhow::Error::new(commit_error_to_worker(&error)))
+            })
     }
 
     async fn seek(&mut self, offsets: &[(PartitionKey, i64)]) -> Result<(), ConsumerError> {
@@ -444,6 +472,48 @@ fn kafka_consumer_error_to_worker(error: &KafkaError) -> WorkerError {
     }
 }
 
+/// commit 失败的结构化分类。rebalance 进行中（generation 变化、成员重新加入）与
+/// coordinator 瞬时不可用都可以在稍后重试：未提交的 watermark 仍保留在 actor 中，
+/// 下一次 commit 会重新提交。超时的结果未知——broker 可能已经持久化。
+fn commit_error_to_worker(error: &KafkaError) -> WorkerError {
+    use RDKafkaErrorCode::*;
+
+    let code = error.rdkafka_error_code();
+    let (kind, retryable, outcome) = match code {
+        Some(RebalanceInProgress | IllegalGeneration | UnknownMemberId | FencedInstanceId) => {
+            (ErrorKind::Rebalance, true, OperationOutcome::NotApplied)
+        }
+        Some(
+            CoordinatorNotAvailable
+            | NotCoordinator
+            | CoordinatorLoadInProgress
+            | BrokerTransportFailure
+            | AllBrokersDown
+            | NetworkException,
+        ) => (
+            ErrorKind::BrokerRetryable,
+            true,
+            OperationOutcome::NotApplied,
+        ),
+        Some(RequestTimedOut | OperationTimedOut) => {
+            (ErrorKind::Timeout, true, OperationOutcome::Unknown)
+        }
+        Some(GroupAuthorizationFailed | TopicAuthorizationFailed) => (
+            ErrorKind::Authorization,
+            false,
+            OperationOutcome::NotApplied,
+        ),
+        _ => (ErrorKind::Commit, false, OperationOutcome::NotApplied),
+    };
+    WorkerError {
+        kind,
+        retryable,
+        outcome,
+        native_code: code.map_or(0, |value| value as i32),
+        message: error.to_string(),
+    }
+}
+
 fn control_tpl(
     consumer: &StreamConsumer<KafkaContext>,
     partitions: &[(String, i32)],
@@ -485,6 +555,22 @@ mod tests {
     fn fatal_consumption_error_is_not_recoverable() {
         let error = KafkaError::MessageConsumptionFatal(RDKafkaErrorCode::BrokerTransportFailure);
         assert!(!is_recoverable_consumer_error(&error));
+    }
+
+    #[test]
+    fn commit_during_rebalance_is_retryable() {
+        let error = KafkaError::ConsumerCommit(RDKafkaErrorCode::IllegalGeneration);
+        let response = commit_error_to_worker(&error).to_error_resp();
+        assert_eq!(response.kind, ErrorKind::Rebalance);
+        assert!(response.retryable);
+        assert_eq!(response.outcome, OperationOutcome::NotApplied);
+
+        let timeout = KafkaError::ConsumerCommit(RDKafkaErrorCode::RequestTimedOut);
+        let response = commit_error_to_worker(&timeout).to_error_resp();
+        assert_eq!(response.outcome, OperationOutcome::Unknown);
+
+        let fatal = KafkaError::ConsumerCommit(RDKafkaErrorCode::OffsetMetadataTooLarge);
+        assert!(!commit_error_to_worker(&fatal).to_error_resp().retryable);
     }
 
     #[test]
