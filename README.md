@@ -116,6 +116,10 @@ if ($message !== null) {
 
 Blocking、Swoole 和 Swow 都使用独立 Consumer stream、相同 frame codec、epoch 校验和有界 reconnect/resume；不会退回 RPC poll。
 
+worker 崩溃或被其它进程重启后，三种 Client 都会自动恢复：重新探测 / 拉起 worker，收到 `CLUSTER_NOT_REGISTERED` 时重放本进程注册过的集群与 OAuth token，然后重试一次（超时不重试，结果未知）。fork 后子进程自动丢弃继承的连接。
+
+建议在 Swoole/Swow reactor 启动前（master 进程中）调用一次 `ensureWorker()`：worker 由扩展 double fork 拉起，多线程进程中 fork 有继承锁导致死锁的风险，超时未就绪的 worker 会被杀掉并在下次 ensure 时重试。
+
 ## 内存预算
 
 主要环境变量：
@@ -128,6 +132,15 @@ Blocking、Swoole 和 Swow 都使用独立 Consumer stream、相同 frame codec�
 | `HI_KAFKA_GLOBAL_IN_FLIGHT_MESSAGES` | 65536 | worker 全局交付条数预算 |
 | `HI_KAFKA_GLOBAL_IN_FLIGHT_BYTES` | 512 MiB | worker 全局交付字节预算 |
 | `HI_KAFKA_CONSUMER_RESUME_GRACE_MS` | 10000 | 断线后保留 Consumer 的恢复窗口 |
+
+Producer 默认值（集群配置中显式设置时以业务为准）：
+
+| librdkafka 配置 | 默认值 | 说明 |
+| --- | ---: | --- |
+| `queue.buffering.max.kbytes` | 131072（128 MiB） | 共享 Producer 本地队列上限。librdkafka 自身默认 1 GiB 是按每进程一个客户端设计的；一个 worker 服务整个节点时会在 broker 变慢时涨到 GiB 级 |
+| `compression.codec` | `lz4` | 未设置 `compression.codec` / `compression.type` 时生效 |
+
+本地队列满时 `produceFnf` 最多等待 1 秒、`produceSync` 在其 `timeoutMs` 内等待空间，仍满则抛出可重试的 `PRODUCER_QUEUE_FULL`。key、value 与 header 值均为任意字节（不要求 UTF-8）。
 
 真实 backend 在 borrowed Kafka record 被复制前申请精确全局 permit；detach/encode 瞬时双份内容按两倍 wire size 计费，编码后只保留一份。librdkafka 本地队列也按协商 byte 上限配置。RSS 验收方法和 allocator tolerance 见架构文档的 release gates。
 
@@ -145,6 +158,10 @@ find php-driver/src php-driver/stubs -name '*.php' -print0 | xargs -0 -n1 php -l
 ```bash
 docker compose -f docker-compose.kafka.yml up -d
 EXT_PATH="$PWD/target/debug/libhi_kafka.so" ./scripts/run-all-e2e.sh
+# 协程用例需要额外加载运行时扩展（swoole 与 swow 不能同时加载）
+PHP_EXTRA_ARGS="-d extension=swoole" ./scripts/run-all-e2e.sh
+# cooperative-sticky 用例需要预建多分区 topic
+HI_KAFKA_E2E_COOPERATIVE_TOPIC=coop-e2e ./scripts/run-all-e2e.sh
 HI_KAFKA_E2E_MESSAGES=2048 EXT_PATH="$PWD/target/debug/libhi_kafka.so" \
     ./scripts/run-consumer-memory-e2e.sh
 BENCH_MESSAGES=100000 BENCH_WARMUP=10000 \
