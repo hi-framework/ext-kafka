@@ -43,6 +43,65 @@ pub struct ConsumerRecord {
 
 #[php_impl]
 impl ConsumerRecord {
+    /// 与用户态 `ConsumerRecord` 相同的构造签名，供测试和伪 driver 使用。
+    ///
+    /// 手工构造的 record 不能用来伪造 ACK：worker 会逐帧校验 subscription、
+    /// epoch 与 delivery id，只接受自己真正投递过的身份。
+    #[allow(clippy::too_many_arguments)]
+    #[php(optional = headers, defaults(headers = None))]
+    pub fn __construct(
+        subscriptionId: i64,
+        subscriptionEpoch: i64,
+        deliveryId: i64,
+        topic: String,
+        partition: i64,
+        offset: i64,
+        timestampMs: i64,
+        wireSize: i64,
+        key: Option<ext_php_rs::binary::Binary<u8>>,
+        value: Option<ext_php_rs::binary::Binary<u8>>,
+        headers: Option<&ZendHashTable>,
+    ) -> PhpResult<Self> {
+        let unsigned = |name: &str, value: i64| {
+            u64::try_from(value)
+                .map_err(|_| PhpException::default(format!("{name} must not be negative")))
+        };
+        let partition = i32::try_from(partition)
+            .map_err(|_| PhpException::default("partition is out of range".to_string()))?;
+        let mut parsed_headers = Vec::new();
+        if let Some(headers) = headers {
+            for (_, header) in headers {
+                let header = header.array().ok_or_else(|| {
+                    PhpException::default("each header must be array{name, value}".to_string())
+                })?;
+                let name = header.get("name").and_then(Zval::str).ok_or_else(|| {
+                    PhpException::default("header name must be a string".to_string())
+                })?;
+                let value = header
+                    .get("value")
+                    .and_then(Zval::zend_str)
+                    .map(|value| value.as_bytes().to_vec())
+                    .ok_or_else(|| {
+                        PhpException::default("header value must be a string".to_string())
+                    })?;
+                parsed_headers.push((name.to_string(), value));
+            }
+        }
+        Ok(Self {
+            subscription_id: unsigned("subscriptionId", subscriptionId)?,
+            subscription_epoch: unsigned("subscriptionEpoch", subscriptionEpoch)?,
+            delivery_id: unsigned("deliveryId", deliveryId)?,
+            topic,
+            partition,
+            offset,
+            timestamp_ms: timestampMs,
+            key: key.map(|value| value.into()),
+            value: value.map(|value| value.into()),
+            headers: parsed_headers,
+            wire_size: unsigned("wireSize", wireSize)?,
+        })
+    }
+
     pub fn subscription_id(&self) -> i64 {
         self.subscription_id as i64
     }
@@ -194,6 +253,7 @@ impl ConsumerStream {
 
 #[php_impl]
 impl ConsumerStream {
+    #[php(defaults(timeoutMs = None))]
     pub fn next(
         &self,
         timeoutMs: Option<i64>,
@@ -329,6 +389,7 @@ impl ConsumerStream {
         Ok(())
     }
 
+    #[php(defaults(reason = None))]
     pub fn nack(
         &self,
         message: &ZendClassObject<ConsumerRecord>,
@@ -356,6 +417,7 @@ impl ConsumerStream {
         Ok(())
     }
 
+    #[php(defaults(timeoutMs = None))]
     pub fn commit(&self, timeoutMs: Option<i64>) -> PhpResult<()> {
         let mut state = self
             .state
@@ -426,14 +488,21 @@ impl ConsumerStream {
         }
     }
 
-    pub fn pause(&self, partitions: &ZendHashTable) -> PhpResult<()> {
-        self.control_partitions(FrameType::ConsumePause, parse_partitions(partitions)?)
+    /// `$partitions` 为空或省略表示当前完整 assignment。
+    #[php(defaults(partitions = None))]
+    pub fn pause(&self, partitions: Option<&ZendHashTable>) -> PhpResult<()> {
+        self.control_partitions(
+            FrameType::ConsumePause,
+            parse_optional_partitions(partitions)?,
+        )
     }
 
-    pub fn resume(&self, partitions: &ZendHashTable) -> PhpResult<()> {
+    /// `$partitions` 为空或省略表示当前完整 assignment。
+    #[php(defaults(partitions = None))]
+    pub fn resume(&self, partitions: Option<&ZendHashTable>) -> PhpResult<()> {
         self.control_partitions(
             FrameType::ConsumePartitionResume,
-            parse_partitions(partitions)?,
+            parse_optional_partitions(partitions)?,
         )
     }
 
@@ -469,6 +538,10 @@ impl ConsumerStream {
             .map_err(|_| PhpException::default("consumer stream lock poisoned".into()))?
             .subscription_id as i64)
     }
+}
+
+fn parse_optional_partitions(partitions: Option<&ZendHashTable>) -> PhpResult<Vec<(String, i32)>> {
+    partitions.map_or_else(|| Ok(Vec::new()), parse_partitions)
 }
 
 fn throwable_message(reason: Option<&ZendObject>) -> String {

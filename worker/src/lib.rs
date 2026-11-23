@@ -17,7 +17,7 @@ pub mod shutdown;
 pub mod stream_core;
 pub mod watermark;
 
-pub use cluster::{ClusterConfig, ClusterRegistry, ClusterRegistryHandle};
+pub use cluster::{ClusterConfig, ClusterRegistry, ClusterRegistryHandle, RegisterOutcome};
 pub use consumer::{ConsumerError, ConsumerHandle, ConsumerManager};
 pub use error::WorkerError;
 pub use metrics::Metrics;

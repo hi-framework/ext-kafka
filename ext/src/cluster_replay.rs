@@ -65,8 +65,7 @@ pub fn snapshot(socket: &str) -> Vec<(String, ReplayEntry)> {
         .unwrap_or_default()
 }
 
-/// 测试 / 监控辅助
-#[allow(dead_code)]
+/// 该 socket 上记录的集群数量。
 pub fn count(socket: &str) -> usize {
     let map = replay_map().lock().unwrap();
     map.get(&PathBuf::from(socket))

@@ -756,8 +756,8 @@ async fn handle_register_cluster(
         )
         .await;
     }
-    let added = registry.register(cluster.clone(), config).await;
-    info!(%cluster, added, "cluster registered");
+    let outcome = registry.register(cluster.clone(), config).await;
+    debug!(%cluster, ?outcome, "cluster registered");
     let mut buf = BytesMut::new();
     RegisterClusterResp::Ok
         .encode(&mut buf)

@@ -48,6 +48,14 @@ struct ClusterEntry {
     version: u64,
 }
 
+/// [`ClusterRegistry::register`] 的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegisterOutcome {
+    Added,
+    Unchanged,
+    Updated,
+}
+
 #[derive(Debug, Default)]
 pub struct ClusterRegistry {
     clusters: RwLock<HashMap<String, ClusterEntry>>,
@@ -58,29 +66,27 @@ impl ClusterRegistry {
         Arc::new(Self::default())
     }
 
-    /// 注册或覆盖一个集群。已存在的同名集群配置会被替换。
+    /// 注册或覆盖一个集群（幂等 upsert）。
     ///
-    /// **token slot 行为**：
-    /// - 新增集群：分配空 slot
-    /// - 覆盖已有集群：**保留**已有 token slot 不清空（同一 Arc）
-    ///   这样运行中已经握住 slot 的 librdkafka 客户端能继续看到 token。
-    ///
-    /// **缓存失效（P1 #7）**：每次覆盖会把内部 `version` 计数 +1。
-    /// Producer / Consumer 用 `get_with_version` 拿配置时同时拿到当前版本号，
-    /// 在自己的 per-cluster 缓存里记录，下次比对发现版本变化 → 自动 rebuild
-    /// librdkafka 客户端。覆盖期间会打 warn 提示。
-    pub async fn register(&self, name: String, config: ClusterConfig) -> bool {
+    /// - 新集群：分配空 token slot，version = 1。
+    /// - 配置与现有**完全相同**：不做任何改变，version 不变。每个 PHP 进程启动时都会
+    ///   重复注册同一份配置，若这里也递增 version，会让共享 Producer 被反复重建。
+    /// - 配置有变化：替换配置并递增 version；token slot 保留同一个 Arc，已持有它的
+    ///   librdkafka 客户端仍能读到 token。Producer 发现 version 变化后切换到新实例，
+    ///   旧实例排干后释放；存量 Consumer subscription 继续使用创建时的配置。
+    pub async fn register(&self, name: String, config: ClusterConfig) -> RegisterOutcome {
         let mut map = self.clusters.write().await;
         match map.get_mut(&name) {
+            Some(entry) if entry.config == config => RegisterOutcome::Unchanged,
             Some(entry) => {
                 entry.config = config;
                 entry.version = entry.version.wrapping_add(1);
-                tracing::warn!(
+                tracing::info!(
                     %name,
                     version = entry.version,
-                    "cluster config overwritten; producer/consumer caches will rebuild on next use"
+                    "cluster config changed; producer will switch generation on next use"
                 );
-                false // 覆盖
+                RegisterOutcome::Updated
             }
             None => {
                 map.insert(
@@ -91,7 +97,7 @@ impl ClusterRegistry {
                         version: 1,
                     },
                 );
-                true // 新增
+                RegisterOutcome::Added
             }
         }
     }
@@ -180,8 +186,8 @@ mod tests {
     #[tokio::test]
     async fn test_register_then_get() {
         let r = ClusterRegistry::new();
-        let added = r.register("main".into(), cfg("kafka:9092")).await;
-        assert!(added);
+        let outcome = r.register("main".into(), cfg("kafka:9092")).await;
+        assert_eq!(outcome, RegisterOutcome::Added);
 
         let got = r.get("main").await.unwrap();
         assert_eq!(got.get("bootstrap.servers").unwrap(), "kafka:9092");
@@ -191,13 +197,32 @@ mod tests {
     async fn test_register_overwrite() {
         let r = ClusterRegistry::new();
         r.register("c".into(), cfg("a:9092")).await;
-        let added = r.register("c".into(), cfg("b:9092")).await;
-        assert!(!added);
+        let outcome = r.register("c".into(), cfg("b:9092")).await;
+        assert_eq!(outcome, RegisterOutcome::Updated);
 
         assert_eq!(
             r.get("c").await.unwrap().get("bootstrap.servers").unwrap(),
             "b:9092"
         );
+    }
+
+    #[tokio::test]
+    async fn test_register_identical_config_keeps_version() {
+        let r = ClusterRegistry::new();
+        r.register("c".into(), cfg("a:9092")).await;
+        let (_, v1) = r.get_with_version("c").await.unwrap();
+
+        let outcome = r.register("c".into(), cfg("a:9092")).await;
+        assert_eq!(outcome, RegisterOutcome::Unchanged);
+        let (_, v2) = r.get_with_version("c").await.unwrap();
+        assert_eq!(
+            v1, v2,
+            "identical re-registration must not rebuild the producer"
+        );
+
+        r.register("c".into(), cfg("b:9092")).await;
+        let (_, v3) = r.get_with_version("c").await.unwrap();
+        assert_eq!(v3, v2 + 1);
     }
 
     #[tokio::test]

@@ -105,7 +105,7 @@ pub(crate) fn ensure(socket: &str) -> Result<(), IpcError> {
 
 /// 把 cluster_replay 里的所有 cluster 注册重发到（可能是新起的）worker。
 /// 失败会立即返回——因为重放发生在 ensure 调用栈内，让上层拿到清晰错误。
-fn replay_clusters(socket: &str) -> Result<(), IpcError> {
+pub(crate) fn replay_clusters(socket: &str) -> Result<(), IpcError> {
     let snap = cluster_replay::snapshot(socket);
     if snap.is_empty() {
         return Ok(());
@@ -159,40 +159,70 @@ fn should_invalidate(e: &IpcError) -> bool {
     }
 }
 
-/// 通用「带一次自动重试」包装。
+/// 通用自动恢复包装。两类恢复各自最多一次，避免故障时形成重试风暴：
 ///
-/// 第一次失败时：
-/// 1. 如果错误暗示 worker 已死（[`should_invalidate`]），让 health 缓存失效
-/// 2. 重试一次——此时 `ensure_worker` 会重新探测，发现 worker 不响应就重新 fork 一个
-/// 3. 第二次仍失败：返回该错误，不再重试，避免循环
+/// - worker 已死（[`should_invalidate`]）：让 health 缓存失效，重试时 `ensure` 会重新
+///   探测，必要时重新 spawn 并重放本进程记录的集群；
+/// - `CLUSTER_NOT_REGISTERED`：worker 被其它进程重启过，本进程的集群不在新 worker
+///   中。重放后重试；该错误在执行前判定，重试不会产生重复消息。
 ///
-/// 重试只针对「worker 死」类错误。业务错误（CidMismatch、Server 错误等）一次返回。
+/// worker 被其它进程重启时两者会先后出现：旧连接先 EOF，重试后才遇到未注册。
 fn with_retry<F, T>(socket: &str, mut op: F) -> Result<T, IpcError>
 where
     F: FnMut() -> Result<T, IpcError>,
 {
-    match op() {
-        Ok(v) => Ok(v),
-        Err(e) if should_invalidate(&e) => {
-            worker_health::invalidate(socket);
-            RETRY_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
-            match op() {
-                Ok(v) => {
+    let mut reconnected = false;
+    let mut replayed = false;
+    loop {
+        let error = match op() {
+            Ok(value) => {
+                if reconnected || replayed {
                     RETRY_SUCCESSES.fetch_add(1, Ordering::Relaxed);
-                    Ok(v)
                 }
-                Err(e2) => {
-                    RETRY_FAILURES.fetch_add(1, Ordering::Relaxed);
-                    // 第二次仍失败：进一步 invalidate，避免下次 fast-path 直接送进死 worker
-                    if should_invalidate(&e2) {
-                        worker_health::invalidate(socket);
-                    }
-                    Err(e2)
-                }
+                return Ok(value);
             }
+            Err(error) => error,
+        };
+        let recover_connection = !reconnected && should_invalidate(&error);
+        let recover_registration =
+            !replayed && is_cluster_not_registered(&error) && cluster_replay::count(socket) > 0;
+        if !recover_connection && !recover_registration {
+            if reconnected || replayed {
+                RETRY_FAILURES.fetch_add(1, Ordering::Relaxed);
+            }
+            if should_invalidate(&error) {
+                worker_health::invalidate(socket);
+            }
+            return Err(error);
         }
-        Err(e) => Err(e),
+        RETRY_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+        if recover_connection {
+            reconnected = true;
+            worker_health::invalidate(socket);
+        } else {
+            replayed = true;
+            replay_clusters(socket)?;
+        }
     }
+}
+
+fn is_cluster_not_registered(e: &IpcError) -> bool {
+    matches!(
+        e,
+        IpcError::Worker {
+            kind: ErrorKind::ClusterNotRegistered,
+            ..
+        }
+    )
+}
+
+/// 把本进程记录的全部集群注册与 OAuth token 重放到 worker。
+///
+/// 供协程 driver 在收到 `CLUSTER_NOT_REGISTERED` 时调用：worker 可能被其它进程
+/// 重启过，本进程的注册只存在于扩展的重放缓存里。
+pub fn replay(socket: &str) -> Result<(), IpcError> {
+    ensure(socket)?;
+    replay_clusters(socket)
 }
 
 /// 通用：write 帧，遇 IO 错就 poison 连接，让池下次重建。

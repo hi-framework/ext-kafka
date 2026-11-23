@@ -42,10 +42,10 @@ impl ClientContext for ProducerOAuthCtx {
     }
 }
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::{OnceCell, RwLock};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 /// FutureProducer 必须以 cluster 名 + token slot 为 ctx 创建，
 /// 类型别名让 ClusterEntry / Producer impl 引用更简洁。
@@ -72,11 +72,18 @@ impl ClusterCell {
     }
 }
 
+/// 配置变化后旧代 Producer 的最长排干时间。超时仍有未送达消息时，释放会让
+/// librdkafka purge 剩余队列，因此会以 error 日志报告丢失条数。
+const RETIRE_FLUSH_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct KafkaProducer {
     registry: ClusterRegistryHandle,
     /// 每个 cluster 名一个 cell。外层 RwLock 仅保护 HashMap 的 entry-set 操作，
     /// 真正的 producer 初始化由内层 OnceCell 串行（不阻塞其它 cluster）。
     producers: RwLock<HashMap<String, Arc<ClusterCell>>>,
+    /// 已被新 generation 取代、仍在后台排干的旧 Producer。shutdown flush 也覆盖它们，
+    /// 保证 worker 退出前不会因直接 drop 而 purge 已 ack 的 FNF 消息。
+    retiring: Arc<StdMutex<Vec<Arc<OAuthFutureProducer>>>>,
 }
 
 impl KafkaProducer {
@@ -84,7 +91,39 @@ impl KafkaProducer {
         Self {
             registry,
             producers: RwLock::new(HashMap::new()),
+            retiring: Arc::new(StdMutex::new(Vec::new())),
         }
+    }
+
+    /// 把旧 generation 交给后台任务：先在有界时间内 flush，再释放。
+    ///
+    /// rust-rdkafka 的 Producer 在 Drop 时会 purge 本地队列；若直接丢弃旧实例，
+    /// 已经向 PHP 回过 enqueue ack 的 FNF 消息会被静默删除。
+    fn retire(&self, cluster: &str, producer: Arc<OAuthFutureProducer>) {
+        self.retiring
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(producer.clone());
+        let retiring = self.retiring.clone();
+        let cluster = cluster.to_string();
+        tokio::spawn(async move {
+            let flushing = producer.clone();
+            let result =
+                tokio::task::spawn_blocking(move || flushing.flush(RETIRE_FLUSH_TIMEOUT)).await;
+            let remaining = producer.in_flight_count();
+            match result {
+                Ok(Ok(())) => debug!(%cluster, "retired producer drained"),
+                _ => error!(
+                    %cluster,
+                    remaining,
+                    "retired producer did not drain in time; remaining messages will be purged"
+                ),
+            }
+            retiring
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|p| !Arc::ptr_eq(p, &producer));
+        });
     }
 
     /// 拿到或建一个 cluster cell（外层 RwLock，快路径走读锁）。
@@ -131,9 +170,17 @@ impl KafkaProducer {
                 current_version,
                 "producer cache stale (config overwritten), rebuilding"
             );
-            // 替换 cell，下一轮 loop 重新初始化
+            // 只有仍是我们观察到的那个 cell 时才替换：并发请求可能已经完成了切换，
+            // 重复替换会把刚建好的新 generation 又丢掉。
             let mut guard = self.producers.write().await;
-            guard.insert(cluster.to_string(), Arc::new(ClusterCell::new()));
+            if guard
+                .get(cluster)
+                .is_some_and(|current| Arc::ptr_eq(current, &cell))
+            {
+                guard.insert(cluster.to_string(), Arc::new(ClusterCell::new()));
+                drop(guard);
+                self.retire(cluster, entry.producer.clone());
+            }
         }
     }
 
@@ -227,13 +274,20 @@ impl Producer for KafkaProducer {
 
     async fn flush(&self, timeout: Duration) -> anyhow::Result<()> {
         // 只 flush 已经初始化好的 cell（OnceCell::get 不触发 init）
-        let producers: Vec<Arc<OAuthFutureProducer>> = {
+        let mut producers: Vec<Arc<OAuthFutureProducer>> = {
             let guard = self.producers.read().await;
             guard
                 .values()
                 .filter_map(|cell| cell.cell.get().map(|e| e.producer.clone()))
                 .collect()
         };
+        producers.extend(
+            self.retiring
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .cloned(),
+        );
         for p in producers {
             let p_clone = p.clone();
             let result = tokio::task::spawn_blocking(move || p_clone.flush(timeout))

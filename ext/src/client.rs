@@ -3,6 +3,10 @@
 //! 把全局的 `hi_kafka_produce_*` 函数封装成对象方法，`socket` 路径作为对象状态，
 //! 避免每次调用都传一遍。
 //!
+//! **默认值**：所有可选参数都用 `#[php(defaults(...))]` 声明 PHP 默认值。否则反射里
+//! 默认值未知，跳过中间可选参数的命名参数调用（如 `produceSync(..., timeoutMs: 1)`）
+//! 会抛 `ArgumentCountError`，与 `ClientInterface` 的签名不一致。
+//!
 //! **参数命名**：方法参数刻意用 **camelCase**（`timeoutMs` / `groupId` / …）。
 //! ext-php-rs 直接把 Rust 参数标识符当 PHP 参数名（只对方法名做 snake→camel），
 //! 而 PHP 是公开 API、应遵循 camelCase 惯例并与 `ClientInterface` / `SwooleClient` /
@@ -33,6 +37,7 @@ impl Client {
     ///
     /// `$socket` 可选；不指定时按 `HI_KAFKA_SOCKET` 环境变量，
     /// 兜底为 `/tmp/hi-kafka-v2.sock`。
+    #[php(defaults(socket = None))]
     pub fn __construct(socket: Option<String>) -> Self {
         Self {
             socket: super::resolve_socket(socket.as_deref()),
@@ -45,6 +50,7 @@ impl Client {
     }
 
     /// 注册或覆盖一个 Kafka 集群。`$config` 须含 `bootstrap.servers`。
+    #[php(defaults(timeoutMs = None))]
     pub fn register_cluster(
         &self,
         cluster: &str,
@@ -69,6 +75,7 @@ impl Client {
 
     /// Fire-and-forget 生产。`$headers` 关联数组（`[]` = 无 headers）；
     /// `$partition` 与 `$timestampMs` 可选，`null` / 缺省 = auto。
+    #[php(defaults(headers = None, partition = None, timestampMs = None))]
     pub fn produce_fnf(
         &self,
         cluster: &str,
@@ -85,6 +92,7 @@ impl Client {
     }
 
     /// 同步生产，等 broker ack。返回 `['ok' => bool, ...]` 数组。
+    #[php(defaults(headers = None, partition = None, timestampMs = None, timeoutMs = None))]
     pub fn produce_sync(
         &self,
         cluster: &str,
@@ -112,6 +120,7 @@ impl Client {
     ///
     /// 用于 protobuf / msgpack / 加密 payload 等二进制场景。
     /// 文本场景仍然可以用 `produceFnf`（HashMap<string, string>，更短）。
+    #[php(defaults(partition = None, timestampMs = None))]
     pub fn produce_fnf_bin(
         &self,
         cluster: &str,
@@ -140,6 +149,7 @@ impl Client {
     }
 
     /// Binary-safe 同步生产。参数同 `produceFnfBin` + `$timeoutMs`。
+    #[php(defaults(partition = None, timestampMs = None, timeoutMs = None))]
     pub fn produce_sync_bin(
         &self,
         cluster: &str,
@@ -183,6 +193,7 @@ impl Client {
 
     /// Open a dedicated protocol-v2 Consumer stream.  The returned object is
     /// not backed by the RPC pool and yields exactly one ConsumerRecord per next().
+    #[php(defaults(config = None, timeoutMs = None))]
     pub fn consume(
         &self,
         cluster: &str,
@@ -220,6 +231,7 @@ impl Client {
     ///
     /// `$extensions` 为 SASL extension key/value（预留，rdkafka 0.38 还没透传给
     /// librdkafka——worker 会存但暂时不用，等 rdkafka 上游开支持自动生效）。
+    #[php(defaults(extensions = None, timeoutMs = None))]
     pub fn set_o_auth_bearer_token(
         &self,
         cluster: &str,

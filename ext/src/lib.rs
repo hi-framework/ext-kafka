@@ -29,6 +29,18 @@ mod spawn;
 mod worker_entry;
 mod worker_health;
 
+/// `cargo test --lib` 的可执行文件里没有 PHP 运行时。ext-php-rs 的 C wrapper 一旦被
+/// 链进来，就会引用 Zend 的**数据**符号，而数据符号必须在加载时就能解析。这里只为
+/// 单测提供占位定义；纯 Rust 单测从不读写它们。函数符号由 build.rs 改为惰性绑定。
+#[cfg(test)]
+#[allow(non_upper_case_globals)]
+mod zend_test_symbols {
+    #[no_mangle]
+    static mut executor_globals: [u64; 1024] = [0; 1024];
+    #[no_mangle]
+    static mut zend_ce_traversable: usize = 0;
+}
+
 use ext_php_rs::binary::Binary;
 use ext_php_rs::binary_slice::BinarySlice;
 use ext_php_rs::convert::IntoZval;
@@ -577,6 +589,55 @@ pub fn hi_kafka_decode_control_resp(bytes: BinarySlice<u8>) -> PhpResult<Zval> {
         .map_err(|e| PhpException::default(e.to_string()))
 }
 
+// === Registration replay ====================================================
+
+/// 记录一次已由协程 driver 成功完成的集群注册。
+///
+/// 阻塞 `Client` 在 Rust 内部注册时自动记录；Swoole/Swow driver 自己走协程 IO，
+/// 必须在收到成功响应后调用本函数，worker 重启后扩展才能把它重放到新 worker。
+#[php_function]
+pub fn hi_kafka_remember_cluster(
+    cluster: &str,
+    config: std::collections::HashMap<String, String>,
+    socket: Option<String>,
+) {
+    let socket = resolve_socket(socket.as_deref());
+    cluster_replay::record_cluster(&socket, cluster, config.into_iter().collect());
+}
+
+/// 记录一次已由协程 driver 成功推送的 OAuth token，语义同 [`hi_kafka_remember_cluster`]。
+#[php_function]
+pub fn hi_kafka_remember_oauth_token(
+    cluster: &str,
+    token: &str,
+    lifetime_ms: i64,
+    principal_name: &str,
+    extensions: Option<std::collections::HashMap<String, String>>,
+    socket: Option<String>,
+) {
+    let socket = resolve_socket(socket.as_deref());
+    cluster_replay::record_oauth_token(
+        &socket,
+        cluster,
+        cluster_replay::OAuthToken {
+            token_value: token.to_string(),
+            lifetime_ms,
+            principal_name: principal_name.to_string(),
+            extensions: extensions.unwrap_or_default().into_iter().collect(),
+        },
+    );
+}
+
+/// 确保 worker 存活，并把本进程记录的全部集群注册重放给它。
+///
+/// worker 被其它进程重启后，本进程的集群不在新 worker 中；driver 收到
+/// `CLUSTER_NOT_REGISTERED` 时调用本函数后再重试一次。
+#[php_function]
+pub fn hi_kafka_replay_clusters(socket: Option<String>) -> PhpResult<()> {
+    let socket = resolve_socket(socket.as_deref());
+    ipc::replay(&socket).map_err(ipc_err_to_php)
+}
+
 // === Control-plane request encoders ========================================
 
 /// 编一帧 SET_OAUTH_BEARER_TOKEN_REQ。
@@ -887,6 +948,9 @@ pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
         .function(wrap_function!(hi_kafka_version))
         .function(wrap_function!(hi_kafka_ensure_worker))
         .function(wrap_function!(hi_kafka_register_cluster))
+        .function(wrap_function!(hi_kafka_remember_cluster))
+        .function(wrap_function!(hi_kafka_remember_oauth_token))
+        .function(wrap_function!(hi_kafka_replay_clusters))
         .function(wrap_function!(hi_kafka_produce_fnf))
         .function(wrap_function!(hi_kafka_produce_sync))
         .function(wrap_function!(hi_kafka_pool_stats))
