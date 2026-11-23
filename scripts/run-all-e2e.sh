@@ -48,6 +48,17 @@ ALL_TESTS=(
 )
 TESTS="${E2E_TESTS:-${ALL_TESTS[@]}}"
 
+# 毫秒时间戳：busybox date 不支持 %N（Alpine 容器内会得到 0）；bash 5 有 EPOCHREALTIME，
+# macOS 自带的 bash 3.2 没有，退回 date。
+now_ms() {
+    if [[ -n "${EPOCHREALTIME:-}" ]]; then
+        local t="${EPOCHREALTIME/[.,]/}"
+        echo $(( ${t:0:${#t}-3} ))
+    else
+        echo $(( $(date +%s%N) / 1000000 ))
+    fi
+}
+
 green() { printf '\033[32m%s\033[0m' "$*"; }
 red()   { printf '\033[31m%s\033[0m' "$*"; }
 yellow() { printf '\033[33m%s\033[0m' "$*"; }
@@ -85,9 +96,9 @@ for t in $TESTS; do
         continue
     fi
     sock="/tmp/e2e-${t}-$$.sock"
-    topic_prefix="e2e-${t}-$(date +%s%N)-$$"
+    topic_prefix="e2e-${t}-$(now_ms)-$$"
 
-    start=$(date +%s%N)
+    start=$(now_ms)
     printf "==> %-25s " "$t"
     # -n 跳过系统 php.ini：避免 xdebug 之类的 observer 在 MSHUTDOWN 阶段崩
     output=$(env \
@@ -95,8 +106,8 @@ for t in $TESTS; do
         HI_KAFKA_BROKERS="${HI_KAFKA_BROKERS:-127.0.0.1:9094}" \
         "$PHP_BIN" -n -d extension="$EXT_PATH" $PHP_EXTRA_ARGS "$script" "$sock" "$topic_prefix" 2>&1)
     rc=$?
-    end=$(date +%s%N)
-    elapsed_ms=$(( (end - start) / 1000000 ))
+    end=$(now_ms)
+    elapsed_ms=$(( end - start ))
 
     if [[ $rc -eq 0 ]] && echo "$output" | grep -qE '★|PASS$|全部 PASS'; then
         echo "$(green PASS) (${elapsed_ms}ms)"

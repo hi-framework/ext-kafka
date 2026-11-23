@@ -62,7 +62,10 @@ $docker = static function (array $args, bool $wait = true) use ($dockerEnv): voi
         proc_close($process);
     }
 };
-$docker(['exec', $params['kafka_container'], 'kafka-topics.sh', '--bootstrap-server', '127.0.0.1:9092', '--create', '--topic', $topic, '--partitions', (string) $params['partitions'], '--replication-factor', '1']);
+// bitnami 镜像把 kafka-topics.sh 放在 PATH 上，apache/kafka 镜像在 /opt/kafka/bin。
+$kafkaTopics = static fn (array $args) => $docker(['exec', $params['kafka_container'], 'sh', '-c',
+    'PATH="$PATH:/opt/kafka/bin:/opt/bitnami/kafka/bin" kafka-topics.sh --bootstrap-server 127.0.0.1:9092 ' . implode(' ', array_map('escapeshellarg', $args))]);
+$kafkaTopics(['--create', '--topic', $topic, '--partitions', (string) $params['partitions'], '--replication-factor', '1']);
 
 // ---------------------------------------------------------------- processes
 $phpCommand = array_merge([PHP_BINARY, '-n', '-d', "extension={$ext}"], preg_split('/\s+/', trim($params['php_args'])) ?: []);
@@ -314,7 +317,7 @@ $supervise(true);
 if (($pid = $workerPid()) > 0) {
     posix_kill($pid, SIGTERM);
 }
-$docker(['exec', $params['kafka_container'], 'kafka-topics.sh', '--bootstrap-server', '127.0.0.1:9092', '--delete', '--topic', $topic]);
+$kafkaTopics(['--delete', '--topic', $topic]);
 
 $restarts = array_map(static fn ($info) => $info['restarts'], $procs);
 file_put_contents("{$out}/restarts.json", json_encode($restarts) . "\n");

@@ -5,8 +5,8 @@
 #   /usr/local/etc/php/conf.d/hi_kafka.ini
 #
 # 用法（默认走 USTC 镜像加速 apk / rustup / crates.io）：
-#   docker build -f Dockerfile.alpine --build-arg PHP_VERSION=8.3 \
-#       -t hi-kafka:php8.3-alpine .
+#   docker build -f Dockerfile.alpine --build-arg PHP_VERSION=8.2 \
+#       -t hi-kafka:php8.2-alpine .
 #
 # 关掉镜像走官方源（境外环境）：
 #   docker build -f Dockerfile.alpine \
@@ -14,11 +14,11 @@
 #       --build-arg RUSTUP_DIST_SERVER=https://static.rust-lang.org \
 #       --build-arg RUSTUP_UPDATE_ROOT=https://static.rust-lang.org/rustup \
 #       --build-arg CRATES_INDEX= \
-#       -t hi-kafka:php8.3-alpine .
+#       -t hi-kafka:php8.2-alpine .
 #
 # 跨架构：
 #   docker buildx build -f Dockerfile.alpine --platform linux/amd64,linux/arm64 \
-#       --build-arg PHP_VERSION=8.3 -t hi-kafka:php8.3-alpine .
+#       --build-arg PHP_VERSION=8.2 -t hi-kafka:php8.2-alpine .
 #
 # Alpine vs Debian 关键差异：
 #   - musl libc 替代 glibc（Rust 自动选 musl target，无需 `--target` 标志）
@@ -54,12 +54,20 @@
 # 4. 镜像 rollout 用蓝绿或 canary：先 1% 流量观察 24h（rdkafka 客户端的事务
 #    协议行为对 librdkafka 版本敏感），无回滚则全量。
 
-ARG PHP_VERSION=8.3
-ARG RUST_VERSION=1.85
-# Alpine 版本：pin 在 3.20（LLVM 18），更高版本（3.22+ → LLVM 22）会让
-# rdkafka-sys 用的 bindgen 0.68 跑 libclang 失败：「Dynamic loading not supported」。
-# 升 bindgen 需上游 rdkafka 跟进，目前 pin Alpine 是稳态。
-ARG ALPINE_VARIANT=alpine3.20
+# 默认与生产一致：PHP 8.2 / Alpine 3.24 / x86_64。
+#
+# 旧注释称 Alpine 3.22+ 的 LLVM 会让 bindgen 失败而 pin 在 3.20：当前唯一的 bindgen
+# 是 ext-php-rs-bindgen 0.72（rdkafka-sys 使用预生成绑定，不跑 bindgen），支持新版
+# LLVM；「Dynamic loading not supported」的真正根因是 musl static crt，已由下面的
+# RUSTFLAGS 解决。libclang 路径在构建时探测，不再写死 llvm 主版本。
+ARG PHP_VERSION=8.2
+ARG ALPINE_VARIANT=alpine3.24
+# 与 rust-toolchain.toml（channel = stable）一致，避免装两套工具链。
+ARG RUST_VERSION=stable
+# 基础镜像可替换为内部镜像（例如预装了业务扩展的 PHP 基础镜像），builder 与 runtime
+# 必须是同一 PHP 版本 / ABI。
+ARG BUILDER_IMAGE=php:${PHP_VERSION}-cli-${ALPINE_VARIANT}
+ARG RUNTIME_IMAGE=php:${PHP_VERSION}-cli-${ALPINE_VARIANT}
 
 # 国内镜像加速（USTC）。设为空字符串则走默认源。
 # - apk 源：dl-cdn.alpinelinux.org → mirrors.ustc.edu.cn
@@ -73,7 +81,7 @@ ARG CRATES_INDEX=sparse+https://mirrors.ustc.edu.cn/crates.io-index/
 # ============================================================================
 # Stage 1: builder
 # ============================================================================
-FROM php:${PHP_VERSION}-cli-${ALPINE_VARIANT} AS builder
+FROM ${BUILDER_IMAGE} AS builder
 
 ARG RUST_VERSION
 ARG APK_MIRROR
@@ -133,8 +141,10 @@ ENV RUSTUP_HOME=/usr/local/rustup \
     RUSTUP_DIST_SERVER=${RUSTUP_DIST_SERVER} \
     RUSTUP_UPDATE_ROOT=${RUSTUP_UPDATE_ROOT} \
     RUSTFLAGS="-C target-feature=-crt-static" \
-    LIBCLANG_PATH=/usr/lib/llvm17/lib \
     BINDGEN_EXTRA_CLANG_ARGS="--sysroot=/"
+# bindgen 需要 LIBCLANG_PATH；按实际安装的 llvm 版本探测。
+RUN printf '#!/bin/sh\nlib=$(ls /usr/lib/llvm*/lib/libclang.so* 2>/dev/null | tail -1)\n[ -n "$lib" ] || { echo "libclang not found" >&2; exit 1; }\nexport LIBCLANG_PATH=$(dirname "$lib")\nexec "$@"\n' > /usr/local/bin/with-libclang \
+    && chmod +x /usr/local/bin/with-libclang
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal --no-modify-path \
     && rustup --version && cargo --version && rustc --version
@@ -160,7 +170,7 @@ RUN mkdir -p proto/src worker/src ext/src \
     && echo 'pub fn _stub() {}' > worker/src/lib.rs \
     && echo 'fn main() {}' > worker/src/main.rs \
     && echo 'pub fn _stub() {}' > ext/src/lib.rs \
-    && cargo build --workspace --release --features hi-kafka-worker/kafka-vendored-tls 2>/dev/null || true
+    && with-libclang cargo build --workspace --release --features hi-kafka-worker/kafka-vendored-tls 2>/dev/null || true
 
 # 真实源码
 COPY proto ./proto
@@ -170,7 +180,7 @@ COPY ext ./ext
 # Alpine 上 ext-php-rs 链 PHP 符号：cdylib 的 undefined symbol 默认允许
 # （Linux ld 行为），运行时由 PHP dlopen 解析。
 RUN touch proto/src/lib.rs worker/src/lib.rs worker/src/main.rs ext/src/lib.rs \
-    && cargo build -p hi-kafka --release --features kafka-vendored-tls
+    && with-libclang cargo build -p hi-kafka --release --features kafka-vendored-tls
 
 # 稳态校验：.so 不应当 NEEDED librdkafka / libssl / libcrypto（全部 vendored 进来）
 RUN file /src/target/release/libhi_kafka.so \
@@ -182,7 +192,7 @@ RUN file /src/target/release/libhi_kafka.so \
 # ============================================================================
 # Stage 2: runtime
 # ============================================================================
-FROM php:${PHP_VERSION}-cli-${ALPINE_VARIANT} AS runtime
+FROM ${RUNTIME_IMAGE} AS runtime
 
 ARG APK_MIRROR
 
