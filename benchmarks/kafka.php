@@ -271,7 +271,14 @@ function benchmark(array $options): array
     // 不能用 str_repeat：重复字节被 lz4 压缩到几乎为零，broker 与网络没有真实负载，
     // 消费侧还会出现数百倍的解压放大。hex 文本的压缩比接近真实业务数据，且是合法
     // UTF-8，旧版本扩展也能运行，便于与基线对比。
-    $payload = substr(bin2hex(random_bytes(intdiv($messageBytes + 1, 2))), 0, $messageBytes);
+    // 每条消息也不能相同：同一批次内的重复 payload 会被 lz4 压缩约 35 倍，单次 1 MiB
+    // 的 fetch 解压后就超出预取上限，worker 内存与吞吐都会失真。轮换的 payload 总长
+    // 超过 lz4 的 64 KiB 匹配窗口。
+    $payloads = [];
+    $payloadCount = max(8, intdiv(256 * 1024, $messageBytes) + 1);
+    for ($i = 0; $i < $payloadCount; $i++) {
+        $payloads[] = substr(bin2hex(random_bytes(intdiv($messageBytes + 1, 2))), 0, $messageBytes);
+    }
     $messageShards = shards($messages, $concurrency);
     $warmupShards = shards($warmup, $concurrency);
     $client = createClient($runtime, $socket, $concurrency);
@@ -283,12 +290,13 @@ function benchmark(array $options): array
             $scenario,
             $cluster,
             $topicPrefix,
-            $payload,
+            $payloads,
             $messageShards,
             $warmupShards,
             $socket,
         ): callable {
-            $operation = static function (int $index) use ($client, $scenario, $cluster, $topicPrefix, $payload, $worker): void {
+            $operation = static function (int $index) use ($client, $scenario, $cluster, $topicPrefix, $payloads, $worker): void {
+                $payload = $payloads[(($index % \count($payloads)) + \count($payloads)) % \count($payloads)];
                 $key = "{$worker}-{$index}";
                 if ($scenario === 'produce-fnf') {
                     $client->produceFnf($cluster, $topicPrefix, $key, $payload);
@@ -344,7 +352,7 @@ function benchmark(array $options): array
             $topic = "{$topicPrefix}-{$worker}";
             $total = $warmupShards[$worker] + $messageShards[$worker];
             for ($i = 0; $i < $total; $i++) {
-                $client->produceFnf($cluster, $topic, "{$worker}-{$i}", $payload);
+                $client->produceFnf($cluster, $topic, "{$worker}-{$i}", $payloads[$i % $payloadCount]);
             }
             $barrier = $client->produceSync($cluster, $topic, "{$worker}-barrier", 'barrier', null, null, null, 30_000);
             if (! ($barrier['ok'] ?? false)) {
