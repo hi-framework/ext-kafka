@@ -132,6 +132,7 @@ worker 在第一次使用时自动拉起，任何运行时、任何时刻都可�
 | `HI_KAFKA_GLOBAL_IN_FLIGHT_MESSAGES` | 65536 | worker 全局交付条数预算 |
 | `HI_KAFKA_GLOBAL_IN_FLIGHT_BYTES` | 512 MiB | worker 全局交付字节预算 |
 | `HI_KAFKA_CONSUMER_RESUME_GRACE_MS` | 10000 | 断线后保留 Consumer 的恢复窗口 |
+| `HI_KAFKA_WORKER_THREADS` | 可用 CPU 数（遵守容器 CPU limit） | worker 的 tokio 工作线程数。调低可减少 worker 内存（48 核机器上设为 8，负载时 RSS 少 20~80 MiB），代价是单进程上百个 Consumer stream 时消费吞吐下降 30%~45% |
 
 Producer 默认值（集群配置中显式设置时以业务为准）：
 

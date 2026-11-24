@@ -65,7 +65,7 @@ red()   { printf '\033[31m%s\033[0m' "$*"; }
 yellow() { printf '\033[33m%s\033[0m' "$*"; }
 
 # 每个测试用独立 socket；测试结束后必须主动杀 worker，否则它被 init 收养后会一直
-# 挂着（ps 里看是 'php' 因为 macOS 没 PR_SET_NAME 改不了 argv[0]）。
+# 挂着（ps 里显示为 hi-kafka-worker ... -- <socket>）。
 # pid 文件由 worker 自己在 bind socket 后写入；recovery 类测试 kill 旧 worker 后
 # 新 worker 写新 pid。统一靠 pid 文件清理。
 cleanup_worker() {

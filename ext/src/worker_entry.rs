@@ -113,9 +113,10 @@ pub unsafe fn run_in_child(config: ChildConfig) -> ! {
     // 隔离。覆盖 user-space argv[0] 字符串内存对 `ps -ef` 显示无效（实测验证）。
     // Darwin 有 `proc_setname_np` 私有 SPI 但 Apple 不保证 ABI 稳定。
     //
-    // 实际效果：macOS 上 `ps -ef` 看 worker 仍像 PHP 进程；运维定位时**用
-    // `pgrep -f /tmp/.*\.sock`** 按 socket 路径找，或用 `scripts/cleanup-ghosts.sh`
-    // 一键清理。
+    // exec 路径不受影响：kernel 记录的是 exec 时的 argv，`ps` 显示为
+    // `hi-kafka-worker ... -- <socket>`。只有 fork 回退路径下 `ps -ef` 看 worker 仍像
+    // PHP 进程；此时用 `pgrep -f /tmp/.*\.sock` 按 socket 路径找，或用
+    // `scripts/cleanup-ghosts.sh` 一键清理。
     #[cfg(target_os = "macos")]
     unsafe {
         let new_name = b"hi-kafka-worker\0";
@@ -160,11 +161,11 @@ pub unsafe fn run_in_child(config: ChildConfig) -> ! {
     hi_kafka_worker::allocator::limit_malloc_arenas();
 
     // 7. 构造 tokio runtime
-    let rt = match tokio::runtime::Builder::new_multi_thread()
-        .thread_name("hi-kafka")
-        .enable_all()
-        .build()
-    {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    if let Some(threads) = worker_threads() {
+        builder.worker_threads(threads);
+    }
+    let rt = match builder.thread_name("hi-kafka").enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {
             error!(error = ?e, "build tokio runtime failed");
@@ -182,6 +183,19 @@ pub unsafe fn run_in_child(config: ChildConfig) -> ! {
 
     // 用 _exit 跳过 atexit handlers（可能继承自 PHP）
     unsafe { libc::_exit(0) };
+}
+
+/// `HI_KAFKA_WORKER_THREADS` 显式指定 tokio 工作线程数；未设置时用 tokio 默认值
+/// （可用 CPU 数，已考虑容器 CPU limit）。
+///
+/// 线程越多，worker 分配器的每线程缓存越多：48 核机器上负载时 RSS 比 8 个线程多
+/// 20~80 MiB；但单进程上百个 Consumer stream 的消费吞吐随线程数增长（8 个线程时
+/// 慢 30%~45%）。默认不限制，需要省内存时由部署调低。
+fn worker_threads() -> Option<usize> {
+    std::env::var("HI_KAFKA_WORKER_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
 }
 
 async fn run_server(config: ChildConfig) -> anyhow::Result<()> {
