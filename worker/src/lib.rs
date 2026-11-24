@@ -7,6 +7,7 @@
 // shutdown / metrics 等 worker 全局状态——参数多是 IPC 风格的合理特征。
 #![allow(clippy::too_many_arguments)]
 
+pub mod allocator;
 #[cfg(feature = "kafka")]
 pub mod broker_watchdog;
 pub mod cluster;

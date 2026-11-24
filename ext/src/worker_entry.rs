@@ -109,7 +109,10 @@ pub unsafe fn run_in_child(config: ChildConfig) -> ! {
         "hi-kafka worker (embedded in .so) starting"
     );
 
-    // 6. 构造 tokio runtime
+    // 6. glibc 上限制 malloc arena 数，必须在创建 tokio / librdkafka 线程之前。
+    hi_kafka_worker::allocator::limit_malloc_arenas();
+
+    // 7. 构造 tokio runtime
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .thread_name("hi-kafka")
         .enable_all()
@@ -122,7 +125,7 @@ pub unsafe fn run_in_child(config: ChildConfig) -> ! {
         }
     };
 
-    // 7. 跑 server
+    // 8. 跑 server
     let result = rt.block_on(run_server(config));
 
     if let Err(e) = result {

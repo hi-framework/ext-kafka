@@ -37,6 +37,9 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // tokio::main 已创建运行时线程；arena 按需在线程首次分配时创建，此时设置仍对之后
+    // 的线程（librdkafka）生效。生产使用嵌入式 worker，在建线程前设置。
+    hi_kafka_worker::allocator::limit_malloc_arenas();
     let cli = Cli::parse();
 
     tracing_subscriber::fmt()
