@@ -89,6 +89,12 @@ for suite in "$@"; do
             run_in "$IMAGE" env EXT_PATH=$EXT PHP_EXTRA_ARGS="$PHP_BASE -d extension=swoole" \
                 E2E_TESTS="consumer-record-memory-swoole-v2 coroutine-consumer-stream-v2 client-recovery-v2 binary-roundtrip-v2 worker-exec-v2" \
                 ./scripts/run-all-e2e.sh
+            # 以容器 1 号进程运行（不经 shell）：覆盖「1 号进程就是业务 PHP」时的僵尸回收
+            zombie_out=$(run_in "$IMAGE" php -n $PHP_BASE -d extension=$EXT \
+                tests/php/worker-zombie-v2.php /tmp/worker-zombie.sock worker-zombie 2>&1) || {
+                echo "$zombie_out"; echo "worker-zombie-v2 FAIL" >&2; exit 1; }
+            echo "$zombie_out"
+            grep -q '★' <<< "$zombie_out" || { echo "worker-zombie-v2 did not PASS" >&2; exit 1; }
             ;;
         soak)
             out="/results/soak-${TAG}-$(date +%Y%m%d-%H%M%S)"
