@@ -14,6 +14,7 @@
     clippy::redundant_pattern_matching
 )]
 
+mod allocator;
 mod client;
 mod client_interface;
 mod cluster_replay;
@@ -41,6 +42,9 @@ mod zend_test_symbols {
     #[no_mangle]
     static mut zend_ce_traversable: usize = 0;
 }
+
+#[global_allocator]
+static GLOBAL: allocator::ProcessAllocator = allocator::ProcessAllocator;
 
 use ext_php_rs::binary::Binary;
 use ext_php_rs::binary_slice::BinarySlice;

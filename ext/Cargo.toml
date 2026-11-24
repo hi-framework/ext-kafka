@@ -32,6 +32,9 @@ bytes.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 libc = "0.2"
+# 只在 exec 出的 worker 进程中启用（见 src/allocator.rs）。local_dynamic_tls：.so 由
+# dlopen 加载，initial-exec TLS 在 musl 上无法重定位。
+mimalloc = { version = "0.1", default-features = false, features = ["local_dynamic_tls"] }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
