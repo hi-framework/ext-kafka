@@ -76,6 +76,49 @@ function sampleStride(int $messages): int
     return max(1, (int) ceil($messages / 10_000));
 }
 
+/**
+ * 测量区间边界上的 CPU 快照：PHP 进程用 getrusage，worker 读 /proc/<pid>/stat 的
+ * utime + stime。ps 的 %cpu 是进程生命周期平均值，会把预装、warm-up 算进去，
+ * 不能用来算每条消息的 CPU。非 Linux 上 worker 一项为 null。
+ *
+ * @return array{php_us:int,worker_ticks:?int}
+ */
+function cpuSnapshot(string $socket): array
+{
+    $usage = getrusage();
+    $phpUs = $usage['ru_utime.tv_sec'] * 1_000_000 + $usage['ru_utime.tv_usec']
+        + $usage['ru_stime.tv_sec'] * 1_000_000 + $usage['ru_stime.tv_usec'];
+    $workerTicks = null;
+    $pid = @file_get_contents($socket . '.pid');
+    if ($pid !== false && ($stat = @file_get_contents('/proc/' . (int) trim($pid) . '/stat')) !== false) {
+        // comm 字段可能含空格，从最后一个 ')' 之后切分；utime/stime 是第 14、15 个字段。
+        $fields = explode(' ', substr($stat, strrpos($stat, ')') + 2));
+        $workerTicks = (int) $fields[11] + (int) $fields[12];
+    }
+    return ['php_us' => $phpUs, 'worker_ticks' => $workerTicks];
+}
+
+/** @return array<string,?float> */
+function cpuSummary(array $workers, int $messages, float $durationSeconds): array
+{
+    usort($workers, static fn (array $a, array $b): int => $a['start_ns'] <=> $b['start_ns']);
+    $first = $workers[0]['cpu_start'];
+    usort($workers, static fn (array $a, array $b): int => $b['end_ns'] <=> $a['end_ns']);
+    $last = $workers[0]['cpu_end'];
+    // Linux 上 USER_HZ 固定为 100。
+    $workerSeconds = $first['worker_ticks'] === null || $last['worker_ticks'] === null
+        ? null : ($last['worker_ticks'] - $first['worker_ticks']) / 100;
+    $phpSeconds = ($last['php_us'] - $first['php_us']) / 1_000_000;
+    return [
+        'php_cpu_s' => round($phpSeconds, 3),
+        'worker_cpu_s' => $workerSeconds,
+        'php_cpu_us_per_msg' => round($phpSeconds * 1_000_000 / $messages, 3),
+        'worker_cpu_us_per_msg' => $workerSeconds === null ? null : round($workerSeconds * 1_000_000 / $messages, 3),
+        'php_cpu_cores' => round($phpSeconds / $durationSeconds, 3),
+        'worker_cpu_cores' => $workerSeconds === null ? null : round($workerSeconds / $durationSeconds, 3),
+    ];
+}
+
 function createClient(string $runtime, string $socket, int $concurrency): Hi\Kafka\ClientInterface
 {
     return match ($runtime) {
@@ -197,6 +240,7 @@ function aggregate(array $workers, int $messages, int $messageBytes): array
             'max_s' => round(max($workerDurations), 6),
         ],
         'workers' => $workerStats,
+        'cpu' => cpuSummary($workers, $messages, $durationSeconds),
     ];
 }
 
@@ -242,6 +286,7 @@ function benchmark(array $options): array
             $payload,
             $messageShards,
             $warmupShards,
+            $socket,
         ): callable {
             $operation = static function (int $index) use ($client, $scenario, $cluster, $topicPrefix, $payload, $worker): void {
                 $key = "{$worker}-{$index}";
@@ -259,10 +304,11 @@ function benchmark(array $options): array
                 $operation(-$i - 1);
             }
 
-            return static function () use ($operation, $messageShards, $worker): array {
+            return static function () use ($operation, $messageShards, $worker, $socket): array {
                 $count = $messageShards[$worker];
                 $stride = sampleStride($count);
                 $latencies = [];
+                $cpuStart = cpuSnapshot($socket);
                 $start = hrtime(true);
                 for ($i = 0; $i < $count; $i++) {
                     if ($i % $stride === 0) {
@@ -273,12 +319,15 @@ function benchmark(array $options): array
                         $operation($i);
                     }
                 }
+                $end = hrtime(true);
                 return [
                     'worker' => $worker,
                     'messages' => $count,
                     'start_ns' => $start,
-                    'end_ns' => hrtime(true),
+                    'end_ns' => $end,
                     'latencies_us' => $latencies,
+                    'cpu_start' => $cpuStart,
+                    'cpu_end' => cpuSnapshot($socket),
                 ];
             };
         };
@@ -308,17 +357,18 @@ function benchmark(array $options): array
             ]);
         }
 
-        $factory = static function (int $worker) use ($streams, $warmupShards, $messageShards, $messageBytes): callable {
+        $factory = static function (int $worker) use ($streams, $warmupShards, $messageShards, $messageBytes, $socket): callable {
             $stream = $streams[$worker];
             for ($i = 0; $i < $warmupShards[$worker]; $i++) {
                 $message = consumeMessage($stream);
                 $stream->ack($message);
             }
 
-            return static function () use ($stream, $messageShards, $worker, $messageBytes): array {
+            return static function () use ($stream, $messageShards, $worker, $messageBytes, $socket): array {
                 $count = $messageShards[$worker];
                 $stride = sampleStride($count);
                 $latencies = [];
+                $cpuStart = cpuSnapshot($socket);
                 $start = hrtime(true);
                 for ($i = 0; $i < $count; $i++) {
                     $operationStart = $i % $stride === 0 ? hrtime(true) : null;
@@ -332,6 +382,7 @@ function benchmark(array $options): array
                     }
                 }
                 $end = hrtime(true);
+                $cpuEnd = cpuSnapshot($socket);
                 $commitStart = hrtime(true);
                 $stream->commit(30_000);
                 $commitUs = (hrtime(true) - $commitStart) / 1000;
@@ -343,6 +394,8 @@ function benchmark(array $options): array
                     'end_ns' => $end,
                     'latencies_us' => $latencies,
                     'commit_us' => $commitUs,
+                    'cpu_start' => $cpuStart,
+                    'cpu_end' => $cpuEnd,
                 ];
             };
         };

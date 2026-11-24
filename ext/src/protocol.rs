@@ -4,10 +4,12 @@ use bytes::BytesMut;
 use hi_kafka_proto::{
     codec, encode_frame, ConnectionRole, ConsumeAck, ConsumeClose, ConsumeCommit, ConsumeCommitted,
     ConsumeMessage, ConsumeNack, ConsumeOpen, ConsumeReady, ConsumeResume, ConsumerPartitions,
-    ErrorResp, FlowControl, FrameType, HelloReq, HelloResp, ProduceFnf, ProduceReq, ProduceResp,
-    RebalanceNotice, RegisterClusterReq, RegisterClusterResp, ResumeToken, SetOAuthBearerTokenReq,
-    SetOAuthBearerTokenResp, CAP_ALL, HEADER_LEN, PROTOCOL_MAJOR, RESUME_TOKEN_LEN,
+    ErrorResp, FlowControl, FrameType, HelloReq, HelloResp, MessageHeader, ProduceFields,
+    ProduceResp, RebalanceNotice, RegisterClusterReq, RegisterClusterResp, ResumeToken,
+    SetOAuthBearerTokenReq, SetOAuthBearerTokenResp, CAP_ALL, HEADER_LEN, PROTOCOL_MAJOR,
+    RESUME_TOKEN_LEN,
 };
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_CID: AtomicU64 = AtomicU64::new(1);
@@ -75,58 +77,57 @@ pub fn parse_hello_resp(bytes: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn build_fnf_frame(
-    cluster: &str,
-    topic: &str,
-    key: &[u8],
-    value: &[u8],
-    headers: Vec<(String, bytes::Bytes)>,
-    partition: i32,
-    timestamp_ms: i64,
-) -> anyhow::Result<Vec<u8>> {
-    let message = produce(cluster, topic, key, value, headers, partition, timestamp_ms);
-    encode(FrameType::ProduceFnf, 0, |payload| message.encode(payload))
+/// 一次生产调用的全部字段（key / value 借用调用方的字节，不复制）。
+pub struct ProduceInput<'a> {
+    pub cluster: &'a str,
+    pub topic: &'a str,
+    pub key: &'a [u8],
+    pub value: &'a [u8],
+    pub headers: &'a [MessageHeader],
+    pub partition: i32,
+    pub timestamp_ms: i64,
 }
-pub fn build_req_frame(
-    cluster: &str,
-    topic: &str,
-    key: &[u8],
-    value: &[u8],
-    headers: Vec<(String, bytes::Bytes)>,
-    partition: i32,
-    timestamp_ms: i64,
-    timeout_ms: u32,
-) -> anyhow::Result<(u64, Vec<u8>)> {
-    let cid = next_cid();
-    let request = ProduceReq {
-        msg: produce(cluster, topic, key, value, headers, partition, timestamp_ms),
-        timeout_ms: timeout_ms.max(1),
-    };
-    Ok((
-        cid,
-        encode(FrameType::ProduceReq, cid, |payload| {
-            request.encode(payload)
-        })?,
-    ))
-}
-fn produce(
-    cluster: &str,
-    topic: &str,
-    key: &[u8],
-    value: &[u8],
-    headers: Vec<(String, bytes::Bytes)>,
-    partition: i32,
-    timestamp_ms: i64,
-) -> ProduceFnf {
-    ProduceFnf {
-        cluster: cluster.into(),
-        topic: topic.into(),
-        key: bytes::Bytes::copy_from_slice(key),
-        value: bytes::Bytes::copy_from_slice(value),
-        partition,
-        timestamp_ms,
-        headers,
+
+impl ProduceInput<'_> {
+    fn fields(&self) -> ProduceFields<'_> {
+        ProduceFields {
+            cluster: self.cluster,
+            topic: self.topic,
+            key: self.key,
+            value: self.value,
+            partition: self.partition,
+            timestamp_ms: self.timestamp_ms,
+            headers: self.headers,
+        }
     }
+}
+
+thread_local! {
+    /// 生产帧的复用编码缓冲。每条消息原本要经过多次中间分配与复制，在 musl
+    /// 分配器上 1 KiB 消息的编码开销约为 glibc 的 10 倍；复用后稳态不再分配。
+    static PRODUCE_FRAME: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// 复用缓冲最多保留的容量；偶发的大消息用完即释放，不长期占住内存。
+const RETAINED_FRAME_CAPACITY: usize = 1024 * 1024;
+
+/// 把一帧 PRODUCE_FNF（`timeout_ms` 为 `None`）或 PRODUCE_REQ 编进复用缓冲，
+/// 再交给 `consume` 发送或复制进 PHP 字符串。`consume` 内不能再次调用本函数。
+pub fn with_produce_frame<R>(
+    input: &ProduceInput<'_>,
+    cid: u64,
+    timeout_ms: Option<u32>,
+    consume: impl FnOnce(&[u8]) -> R,
+) -> anyhow::Result<R> {
+    PRODUCE_FRAME.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        let encoded = input.fields().encode_frame(cid, timeout_ms, &mut buf);
+        let result = encoded.map(|()| consume(&buf));
+        if buf.capacity() > RETAINED_FRAME_CAPACITY {
+            *buf = Vec::new();
+        }
+        result.map_err(|e| anyhow::anyhow!(e))
+    })
 }
 
 #[derive(Debug)]

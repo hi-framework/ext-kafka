@@ -6,13 +6,14 @@
 
 use crate::cluster_replay::{self, OAuthToken};
 use crate::pool;
+use crate::protocol;
 use crate::spawn;
 use crate::worker_health::{self, EnsureOutcome};
 use bytes::BytesMut;
 use hi_kafka_proto::{
-    codec, encode_frame, ErrorKind, ErrorResp, FrameType, OperationOutcome, ProduceFnf, ProduceReq,
-    ProduceResp, RegisterClusterReq, RegisterClusterResp, SetOAuthBearerTokenReq,
-    SetOAuthBearerTokenResp, HEADER_LEN,
+    codec, encode_frame, ErrorKind, ErrorResp, FrameType, OperationOutcome, ProduceResp,
+    RegisterClusterReq, RegisterClusterResp, SetOAuthBearerTokenReq, SetOAuthBearerTokenResp,
+    HEADER_LEN,
 };
 use std::io::{Read, Write};
 use std::path::Path;
@@ -235,13 +236,36 @@ fn write_frame(
 ) -> Result<(), IpcError> {
     let mut frame = BytesMut::new();
     encode_frame(kind, cid, payload, &mut frame).map_err(|e| IpcError::Encode(e.to_string()))?;
+    write_encoded(conn, &frame, write_timeout)
+}
+
+/// 写一帧已编码好的完整字节，遇 IO 错就 poison 连接。
+fn write_encoded(
+    conn: &mut pool::PooledConn,
+    frame: &[u8],
+    write_timeout: Option<Duration>,
+) -> Result<(), IpcError> {
     let stream = conn.stream_mut();
     stream.set_write_timeout(write_timeout)?;
-    if let Err(e) = stream.write_all(&frame).and_then(|_| stream.flush()) {
+    if let Err(e) = stream.write_all(frame).and_then(|_| stream.flush()) {
         conn.poison();
         return Err(e.into());
     }
     Ok(())
+}
+
+/// 在复用缓冲里编码生产帧并直接写出，不经过中间 payload 与 frame 缓冲。
+fn write_produce_frame(
+    conn: &mut pool::PooledConn,
+    input: &protocol::ProduceInput<'_>,
+    cid: u64,
+    timeout_ms: Option<u32>,
+    write_timeout: Duration,
+) -> Result<(), IpcError> {
+    protocol::with_produce_frame(input, cid, timeout_ms, |frame| {
+        write_encoded(conn, frame, Some(write_timeout))
+    })
+    .map_err(|e| IpcError::Encode(e.to_string()))?
 }
 
 #[derive(Debug, Clone)]
@@ -256,53 +280,22 @@ pub struct ProduceOptions {
 // 故意不 `derive(Default)`：默认 0 会被 rdkafka 当作「写第 0 分区 + 时间戳 0」
 // 而不是「auto」，是语义陷阱。要构造就显式给三个字段。
 
-fn encode_produce_payload_bin(
-    cluster: &str,
-    topic: &str,
-    key: &[u8],
-    value: &[u8],
-    opts: &ProduceOptions,
-) -> Result<BytesMut, IpcError> {
-    let msg = ProduceFnf {
-        cluster: cluster.to_string(),
-        topic: topic.to_string(),
-        key: bytes::Bytes::copy_from_slice(key),
-        value: bytes::Bytes::copy_from_slice(value),
+fn produce_input<'a>(
+    cluster: &'a str,
+    topic: &'a str,
+    key: &'a [u8],
+    value: &'a [u8],
+    opts: &'a ProduceOptions,
+) -> protocol::ProduceInput<'a> {
+    protocol::ProduceInput {
+        cluster,
+        topic,
+        key,
+        value,
+        headers: &opts.headers,
         partition: opts.partition,
         timestamp_ms: opts.timestamp_ms,
-        headers: opts.headers.clone(),
-    };
-    let mut payload = BytesMut::new();
-    msg.encode(&mut payload)
-        .map_err(|e| IpcError::Encode(e.to_string()))?;
-    Ok(payload)
-}
-
-fn encode_produce_req_payload_bin(
-    cluster: &str,
-    topic: &str,
-    key: &[u8],
-    value: &[u8],
-    opts: &ProduceOptions,
-    timeout: Duration,
-) -> Result<BytesMut, IpcError> {
-    let timeout_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
-    let req = ProduceReq {
-        msg: ProduceFnf {
-            cluster: cluster.to_string(),
-            topic: topic.to_string(),
-            key: bytes::Bytes::copy_from_slice(key),
-            value: bytes::Bytes::copy_from_slice(value),
-            partition: opts.partition,
-            timestamp_ms: opts.timestamp_ms,
-            headers: opts.headers.clone(),
-        },
-        timeout_ms: timeout_ms.max(1),
-    };
-    let mut payload = BytesMut::new();
-    req.encode(&mut payload)
-        .map_err(|e| IpcError::Encode(e.to_string()))?;
-    Ok(payload)
+    }
 }
 
 /// 生产一条消息；key / value 为任意字节（PHP 字符串是字节串，不要求 UTF-8）。
@@ -328,18 +321,12 @@ fn produce_fnf_bin_inner(
     opts: &ProduceOptions,
 ) -> Result<(), IpcError> {
     ensure(socket)?;
-    let payload = encode_produce_payload_bin(cluster, topic, key, value, opts)?;
+    let input = produce_input(cluster, topic, key, value, opts);
     let cid = next_cid();
     let pool = pool::pool_for(Path::new(socket));
     let mut conn = pool.acquire()?;
     let timeout = Duration::from_secs(5);
-    write_frame(
-        &mut conn,
-        FrameType::ProduceFnf,
-        cid,
-        &payload,
-        Some(timeout),
-    )?;
+    write_produce_frame(&mut conn, &input, cid, None, timeout)?;
     let (kind, _payload) = recv_resp(&mut conn, cid, timeout)?;
     if kind != FrameType::ProduceResp {
         conn.poison();
@@ -372,18 +359,12 @@ fn produce_sync_bin_inner(
     timeout: Duration,
 ) -> Result<ProduceResp, IpcError> {
     ensure(socket)?;
-    let payload = encode_produce_req_payload_bin(cluster, topic, key, value, opts, timeout)?;
+    let input = produce_input(cluster, topic, key, value, opts);
+    let timeout_ms = (timeout.as_millis().min(u32::MAX as u128) as u32).max(1);
     let cid = next_cid();
     let pool = pool::pool_for(Path::new(socket));
     let mut conn = pool.acquire()?;
-
-    write_frame(
-        &mut conn,
-        FrameType::ProduceReq,
-        cid,
-        &payload,
-        Some(timeout),
-    )?;
+    write_produce_frame(&mut conn, &input, cid, Some(timeout_ms), timeout)?;
 
     let io_timeout = timeout + Duration::from_secs(2);
     let (kind, resp_payload) = recv_resp(&mut conn, cid, io_timeout)?;
@@ -777,34 +758,57 @@ mod tests {
         assert_eq!(s.failures, direct.2);
     }
 
-    // === encode_produce_payload_bin ======================================
+    // === produce frame encoding =========================================
+
+    fn decode_frame(frame: &[u8]) -> (hi_kafka_proto::Header, &[u8]) {
+        let header = codec::decode_header(&frame[..HEADER_LEN]).unwrap();
+        assert_eq!(frame.len(), HEADER_LEN + header.payload_len as usize);
+        (header, &frame[HEADER_LEN..])
+    }
 
     #[test]
-    fn test_encode_produce_payload_binary_safe() {
-        // key/value 含 null 字节应该被完整编码进去
+    fn test_produce_frame_roundtrips_binary_key_value_and_headers() {
+        let opts = ProduceOptions {
+            headers: vec![("k1".into(), bytes::Bytes::from_static(b"v\x00\xff"))],
+            partition: 3,
+            timestamp_ms: 12345,
+        };
+        let input = produce_input("cluster", "topic", b"k\x00ey", b"v\x00al\xff", &opts);
+        let decoded = protocol::with_produce_frame(&input, 7, None, |frame| {
+            let (header, payload) = decode_frame(frame);
+            assert_eq!(header.kind, FrameType::ProduceFnf);
+            assert_eq!(header.cid, 7);
+            hi_kafka_proto::ProduceFnf::decode(payload).unwrap()
+        })
+        .unwrap();
+        assert_eq!(decoded.cluster, "cluster");
+        assert_eq!(decoded.topic, "topic");
+        assert_eq!(decoded.key.as_ref(), b"k\x00ey");
+        assert_eq!(decoded.value.as_ref(), b"v\x00al\xff");
+        assert_eq!(decoded.partition, 3);
+        assert_eq!(decoded.timestamp_ms, 12345);
+        assert_eq!(decoded.headers, opts.headers);
+    }
+
+    #[test]
+    fn test_produce_req_frame_carries_timeout_and_reuses_buffer() {
         let opts = ProduceOptions {
             headers: vec![],
             partition: -1,
             timestamp_ms: -1,
         };
-        let key = b"k\x00ey";
-        let value = b"v\x00al\xff";
-        let payload = encode_produce_payload_bin("c", "t", key, value, &opts).unwrap();
-        // payload 内应能找到原始字节序列
-        assert!(payload.contains(&0x00), "null 字节被保留");
-        assert!(payload.contains(&0xff), "0xff 字节被保留");
-    }
-
-    #[test]
-    fn test_encode_produce_payload_headers_preserved() {
-        let opts = ProduceOptions {
-            headers: vec![("k1".into(), bytes::Bytes::from_static(b"v1"))],
-            partition: 0,
-            timestamp_ms: 12345,
-        };
-        let payload = encode_produce_payload_bin("cluster", "topic", b"k", b"v", &opts).unwrap();
-        // header key 字面量应能在 payload 里找到
-        let s = String::from_utf8_lossy(&payload);
-        assert!(s.contains("k1"), "header 键应被序列化");
+        // 先编一条大消息再编小消息：复用缓冲必须被清空，不能残留上一帧的字节。
+        let large = vec![1u8; 4096];
+        let big = produce_input("c", "t", b"k", &large, &opts);
+        protocol::with_produce_frame(&big, 1, None, |frame| frame.len()).unwrap();
+        let small = produce_input("c", "t", b"k", b"v", &opts);
+        let decoded = protocol::with_produce_frame(&small, 2, Some(1500), |frame| {
+            let (header, payload) = decode_frame(frame);
+            assert_eq!(header.kind, FrameType::ProduceReq);
+            hi_kafka_proto::ProduceReq::decode(payload).unwrap()
+        })
+        .unwrap();
+        assert_eq!(decoded.timeout_ms, 1500);
+        assert_eq!(decoded.msg.value.as_ref(), b"v");
     }
 }

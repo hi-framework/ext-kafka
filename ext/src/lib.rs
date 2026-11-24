@@ -44,9 +44,11 @@ mod zend_test_symbols {
 
 use ext_php_rs::binary::Binary;
 use ext_php_rs::binary_slice::BinarySlice;
+use ext_php_rs::boxed::ZBox;
 use ext_php_rs::convert::IntoZval;
+use ext_php_rs::flags::DataType;
 use ext_php_rs::prelude::*;
-use ext_php_rs::types::{ZendClassObject, ZendHashTable, Zval};
+use ext_php_rs::types::{ZendClassObject, ZendHashTable, ZendStr, Zval};
 
 pub use client::Client;
 pub use consumer_stream::{ConsumerRecord, ConsumerStream};
@@ -508,19 +510,11 @@ pub fn hi_kafka_encode_fnf_frame(
     headers: Option<&ZendHashTable>,
     partition: Option<i64>,
     timestamp_ms: Option<i64>,
-) -> PhpResult<Binary<u8>> {
+) -> PhpResult<ZendBinary> {
     let opts = build_options(headers, partition, timestamp_ms)?;
-    let bytes = protocol::build_fnf_frame(
-        cluster,
-        topic,
-        &key,
-        &value,
-        opts.headers,
-        opts.partition,
-        opts.timestamp_ms,
-    )
-    .map_err(|e| PhpException::default(e.to_string()))?;
-    Ok(Binary::from(bytes))
+    let input = produce_input(cluster, topic, &key, &value, &opts);
+    protocol::with_produce_frame(&input, 0, None, ZendBinary::copy_from)
+        .map_err(|e| PhpException::default(e.to_string()))
 }
 
 /// 编一帧 PRODUCE_REQ，返回 `['cid' => int, 'frame' => binary]`。
@@ -537,18 +531,53 @@ pub fn hi_kafka_encode_req_frame(
 ) -> PhpResult<Zval> {
     let opts = build_options(headers, partition, timestamp_ms)?;
     let timeout_ms = require_positive_u32("timeout_ms", timeout_ms.unwrap_or(5000))?;
-    let (cid, bytes) = protocol::build_req_frame(
+    let input = produce_input(cluster, topic, &key, &value, &opts);
+    let cid = protocol::next_cid();
+    let frame = protocol::with_produce_frame(&input, cid, Some(timeout_ms), ZendBinary::copy_from)
+        .map_err(|e| PhpException::default(e.to_string()))?;
+    let mut ht = ZendHashTable::new();
+    put(&mut ht, "cid", cid as i64)?;
+    put(&mut ht, "frame", frame)?;
+    ht.into_zval(false)
+        .map_err(|e| PhpException::default(format!("into_zval: {e}")))
+}
+
+fn produce_input<'a>(
+    cluster: &'a str,
+    topic: &'a str,
+    key: &'a [u8],
+    value: &'a [u8],
+    opts: &'a ipc::ProduceOptions,
+) -> protocol::ProduceInput<'a> {
+    protocol::ProduceInput {
         cluster,
         topic,
-        &key,
-        &value,
-        opts.headers,
-        opts.partition,
-        opts.timestamp_ms,
-        timeout_ms,
-    )
-    .map_err(|e| PhpException::default(e.to_string()))?;
-    cid_frame_zval(cid, bytes)
+        key,
+        value,
+        headers: &opts.headers,
+        partition: opts.partition,
+        timestamp_ms: opts.timestamp_ms,
+    }
+}
+
+/// 已复制进 Zend 的 binary string。帧在复用缓冲里编码，返回给 PHP 时只复制这一次。
+pub struct ZendBinary(ZBox<ZendStr>);
+
+impl ZendBinary {
+    fn copy_from(bytes: &[u8]) -> Self {
+        Self(ZendStr::new(bytes, false))
+    }
+}
+
+impl IntoZval for ZendBinary {
+    const TYPE: DataType = DataType::String;
+    const NULLABLE: bool = false;
+
+    fn set_zval(self, zv: &mut Zval, _persistent: bool) -> ext_php_rs::error::Result<()> {
+        // 只用于函数返回值，Zend 返回值永远是非持久的。
+        zv.set_zend_string(self.0);
+        Ok(())
+    }
 }
 
 /// 仅解析 13B 帧头，返回 `['kind' => int, 'cid' => int, 'payload_len' => int]`。

@@ -31,7 +31,7 @@ pub use frame::{
 pub use oauth::{SetOAuthBearerTokenReq, SetOAuthBearerTokenResp};
 pub use payload::{
     ConnectionRole, DeliveryAck, DeliveryErr, HelloReq, HelloResp, MessageHeader, PayloadError,
-    ProduceFnf, ProduceReq, ProduceResp, AUTO_PARTITION, AUTO_TIMESTAMP, CAP_ALL,
+    ProduceFields, ProduceFnf, ProduceReq, ProduceResp, AUTO_PARTITION, AUTO_TIMESTAMP, CAP_ALL,
     CAP_CONSUMER_STREAM, CAP_PRODUCER, MAX_MESSAGE_HEADERS,
 };
 pub use stream::{

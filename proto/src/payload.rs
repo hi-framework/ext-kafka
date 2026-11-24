@@ -51,6 +51,9 @@ pub enum PayloadError {
 
     #[error("invalid tag 0x{tag:02x} in {field}")]
     InvalidTag { tag: u8, field: &'static str },
+
+    #[error("payload too large: {0} > {max}", max = crate::frame::MAX_PAYLOAD_LEN)]
+    FrameTooLarge(usize),
 }
 
 /// Kafka 消息头：`(name, value)`。name 是 UTF-8 字符串，value 是任意字节序列。
@@ -178,16 +181,101 @@ impl Default for ProduceFnf {
     }
 }
 
-impl ProduceFnf {
-    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), PayloadError> {
-        write_str_u16(&self.cluster, buf)?;
-        write_str_u16(&self.topic, buf)?;
-        write_bytes_u32(&self.key, buf)?;
-        write_bytes_u32(&self.value, buf)?;
+/// 生产消息字段的借用视图，是 PRODUCE_FNF / PRODUCE_REQ 线格式的唯一编码实现。
+///
+/// 扩展侧编码时 key / value 直接借用 PHP 字符串，不必先复制进 [`ProduceFnf`]。
+#[derive(Debug, Clone, Copy)]
+pub struct ProduceFields<'a> {
+    pub cluster: &'a str,
+    pub topic: &'a str,
+    pub key: &'a [u8],
+    pub value: &'a [u8],
+    pub partition: i32,
+    pub timestamp_ms: i64,
+    pub headers: &'a [MessageHeader],
+}
+
+impl ProduceFields<'_> {
+    /// PRODUCE_FNF payload 的精确字节数（PRODUCE_REQ 再加 4 字节 timeout）。
+    pub fn encoded_len(&self) -> usize {
+        let headers: usize = self
+            .headers
+            .iter()
+            .map(|(name, value)| 2 + name.len() + 4 + value.len())
+            .sum();
+        2 + self.cluster.len()
+            + 2
+            + self.topic.len()
+            + 4
+            + self.key.len()
+            + 4
+            + self.value.len()
+            + 4
+            + 8
+            + 4
+            + headers
+    }
+
+    pub fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), PayloadError> {
+        write_str_u16(self.cluster, buf)?;
+        write_str_u16(self.topic, buf)?;
+        write_bytes_u32(self.key, buf)?;
+        write_bytes_u32(self.value, buf)?;
         buf.put_i32(self.partition);
         buf.put_i64(self.timestamp_ms);
-        write_headers(&self.headers, buf)?;
+        write_headers(self.headers, buf)?;
         Ok(())
+    }
+
+    /// 把整帧（header + payload）写入 `buf`，只按精确长度预留一次容量。
+    /// `timeout_ms` 为 `None` 时编码 PRODUCE_FNF，否则编码 PRODUCE_REQ。
+    ///
+    /// 生产热路径上中间缓冲的逐步扩容与多次复制在 musl 分配器上代价很高，因此
+    /// 不经过 [`crate::encode_frame`]。`buf` 可以复用：写入前会先清空。
+    pub fn encode_frame(
+        &self,
+        cid: u64,
+        timeout_ms: Option<u32>,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), PayloadError> {
+        let payload_len = self.encoded_len() + if timeout_ms.is_some() { 4 } else { 0 };
+        if payload_len > crate::frame::MAX_PAYLOAD_LEN {
+            return Err(PayloadError::FrameTooLarge(payload_len));
+        }
+        let kind = if timeout_ms.is_some() {
+            crate::frame::FrameType::ProduceReq
+        } else {
+            crate::frame::FrameType::ProduceFnf
+        };
+        buf.clear();
+        buf.reserve(crate::frame::HEADER_LEN + payload_len);
+        buf.put_u32(payload_len as u32);
+        buf.put_u8(kind as u8);
+        buf.put_u64(cid);
+        self.encode(buf)?;
+        if let Some(timeout_ms) = timeout_ms {
+            buf.put_u32(timeout_ms);
+        }
+        debug_assert_eq!(buf.len(), crate::frame::HEADER_LEN + payload_len);
+        Ok(())
+    }
+}
+
+impl ProduceFnf {
+    pub fn fields(&self) -> ProduceFields<'_> {
+        ProduceFields {
+            cluster: &self.cluster,
+            topic: &self.topic,
+            key: &self.key,
+            value: &self.value,
+            partition: self.partition,
+            timestamp_ms: self.timestamp_ms,
+            headers: &self.headers,
+        }
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), PayloadError> {
+        self.fields().encode(buf)
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, PayloadError> {
@@ -219,9 +307,9 @@ impl ProduceFnf {
     }
 }
 
-pub(crate) fn write_headers(
+pub(crate) fn write_headers<B: BufMut>(
     headers: &[MessageHeader],
-    buf: &mut BytesMut,
+    buf: &mut B,
 ) -> Result<(), PayloadError> {
     if headers.len() > MAX_MESSAGE_HEADERS {
         return Err(PayloadError::FieldTooLarge(headers.len()));
@@ -379,7 +467,7 @@ impl ProduceResp {
     }
 }
 
-fn write_str_u16(s: &str, buf: &mut BytesMut) -> Result<(), PayloadError> {
+fn write_str_u16<B: BufMut>(s: &str, buf: &mut B) -> Result<(), PayloadError> {
     if s.len() > u16::MAX as usize {
         return Err(PayloadError::FieldTooLarge(s.len()));
     }
@@ -388,7 +476,7 @@ fn write_str_u16(s: &str, buf: &mut BytesMut) -> Result<(), PayloadError> {
     Ok(())
 }
 
-fn write_bytes_u32(b: &[u8], buf: &mut BytesMut) -> Result<(), PayloadError> {
+fn write_bytes_u32<B: BufMut>(b: &[u8], buf: &mut B) -> Result<(), PayloadError> {
     if b.len() > u32::MAX as usize {
         return Err(PayloadError::FieldTooLarge(b.len()));
     }
@@ -428,6 +516,62 @@ fn read_bytes_u32<B: Buf>(buf: &mut B) -> Result<Bytes, PayloadError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn produce_fields_frame_matches_owned_encoding() {
+        let msg = ProduceFnf {
+            cluster: "c".into(),
+            topic: "orders".into(),
+            key: Bytes::from_static(b"k\x00\xff"),
+            value: Bytes::from(vec![7u8; 3000]),
+            partition: 2,
+            timestamp_ms: 1_700_000_000_000,
+            headers: vec![("trace".into(), Bytes::from_static(b"\x01\x02"))],
+        };
+        let mut reused = vec![0xAA; 8];
+        for timeout_ms in [None, Some(1500)] {
+            let mut payload = BytesMut::new();
+            let kind = match timeout_ms {
+                None => {
+                    msg.encode(&mut payload).unwrap();
+                    crate::FrameType::ProduceFnf
+                }
+                Some(timeout_ms) => {
+                    ProduceReq {
+                        msg: msg.clone(),
+                        timeout_ms,
+                    }
+                    .encode(&mut payload)
+                    .unwrap();
+                    crate::FrameType::ProduceReq
+                }
+            };
+            let mut expected = BytesMut::new();
+            crate::encode_frame(kind, 9, &payload, &mut expected).unwrap();
+
+            msg.fields()
+                .encode_frame(9, timeout_ms, &mut reused)
+                .unwrap();
+            assert_eq!(reused, expected.as_ref());
+        }
+    }
+
+    #[test]
+    fn produce_fields_frame_rejects_oversized_payload() {
+        let value = vec![0u8; crate::MAX_PAYLOAD_LEN];
+        let fields = ProduceFields {
+            cluster: "c",
+            topic: "t",
+            key: b"",
+            value: &value,
+            partition: AUTO_PARTITION,
+            timestamp_ms: AUTO_TIMESTAMP,
+            headers: &[],
+        };
+        let mut buf = Vec::new();
+        let err = fields.encode_frame(1, None, &mut buf).unwrap_err();
+        assert!(matches!(err, PayloadError::FrameTooLarge(_)));
+    }
 
     #[test]
     fn hello_v2_roundtrip_includes_role_and_capabilities() {

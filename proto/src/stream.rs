@@ -156,7 +156,31 @@ pub struct ConsumeMessage {
 }
 
 impl ConsumeMessage {
+    /// 编码后的精确字节数。
+    pub fn encoded_len(&self) -> usize {
+        let nullable = |value: &Option<Bytes>| 4 + value.as_ref().map_or(0, |v| v.len());
+        let headers: usize = self
+            .headers
+            .iter()
+            .map(|(name, value)| 2 + name.len() + 4 + value.len())
+            .sum();
+        8 * 3
+            + 2
+            + self.topic.len()
+            + 4
+            + 8
+            + 8
+            + nullable(&self.key)
+            + nullable(&self.value)
+            + 4
+            + headers
+            + 8
+    }
+
     pub fn encode(&self, buf: &mut BytesMut) -> Result<(), PayloadError> {
+        // 消费热路径：一次预留到位。逐字段增长会让大 value 经历多次 realloc 与整段
+        // 复制，在 musl 分配器上尤其昂贵。
+        buf.reserve(self.encoded_len());
         buf.put_u64(self.subscription_id);
         buf.put_u64(self.subscription_epoch);
         buf.put_u64(self.delivery_id);
@@ -711,6 +735,7 @@ mod tests {
         };
         let mut buf = BytesMut::new();
         value.encode(&mut buf).unwrap();
+        assert_eq!(buf.len(), value.encoded_len());
         assert_eq!(ConsumeMessage::decode(&buf).unwrap(), value);
     }
 
@@ -731,6 +756,7 @@ mod tests {
         };
         let mut buf = BytesMut::new();
         tombstone.encode(&mut buf).unwrap();
+        assert_eq!(buf.len(), tombstone.encoded_len());
         let decoded = ConsumeMessage::decode(&buf).unwrap();
         assert_eq!(decoded.key, Some(Bytes::new()));
         assert_eq!(decoded.value, None);
