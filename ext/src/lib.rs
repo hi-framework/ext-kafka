@@ -1004,6 +1004,12 @@ fn put<V: IntoZval>(ht: &mut ZendHashTable, key: &str, value: V) -> PhpResult<()
 /// 完成。ext-php-rs 0.14+ 的 `#[php(startup = ...)]` 包装器先调用本函数，随后才
 /// 注册 `ModuleBuilder` 中声明的类，因此类解析 `get_ce()` 时 interface 已存在。
 fn module_startup(_type: i32, module_number: i32) -> i32 {
+    // spawn 以 `php -n -d extension=<本 .so>` exec 出的 worker 进程：在这里接管，
+    // 永不返回到 PHP（见 `spawn` 模块文档）。
+    if let Some(config) = worker_entry::exec_config_from_env() {
+        // SAFETY: 这是 exec 出的全新进程，尚未执行任何 PHP 代码，不会再回到 PHP。
+        unsafe { worker_entry::run_in_child(config) };
+    }
     client_interface::register();
     consumer_stream_interface::register();
     kafka_exception::register();

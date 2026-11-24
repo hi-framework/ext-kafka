@@ -1,6 +1,6 @@
 //! `php.ini` 配置入口。
 //!
-//! 注册 4 个 ini 项给运维侧用，并在 fork worker 之前把它们解析出来：
+//! 注册 5 个 ini 项给运维侧用，并在 fork worker 之前把它们解析出来：
 //!
 //! | ini 名                       | 类型   | 默认值  | 等价 env                    |
 //! |------------------------------|--------|---------|-----------------------------|
@@ -8,6 +8,7 @@
 //! | `hi_kafka.log_file`          | string | (空)    | `HI_KAFKA_LOG_FILE`         |
 //! | `hi_kafka.drain_timeout_ms`  | int    | `10000` | `HI_KAFKA_DRAIN_TIMEOUT_MS` |
 //! | `hi_kafka.metrics_addr`      | string | (空=关) | `HI_KAFKA_METRICS_ADDR`     |
+//! | `hi_kafka.php_binary`        | string | (自动)  | `HI_KAFKA_PHP_BINARY`       |
 //!
 //! 优先级：**env > ini > 内置默认**。env 显式给值时一律生效（兼容旧部署 & 方便
 //! 容器/k8s 覆盖），否则用 ini，最后兜底默认。
@@ -22,13 +23,15 @@ pub const INI_LOG_LEVEL: &str = "hi_kafka.log_level";
 pub const INI_LOG_FILE: &str = "hi_kafka.log_file";
 pub const INI_DRAIN_TIMEOUT_MS: &str = "hi_kafka.drain_timeout_ms";
 pub const INI_METRICS_ADDR: &str = "hi_kafka.metrics_addr";
+pub const INI_PHP_BINARY: &str = "hi_kafka.php_binary";
 
 pub const DEFAULT_LOG_LEVEL: &str = "info";
 pub const DEFAULT_LOG_FILE: &str = "";
 pub const DEFAULT_DRAIN_TIMEOUT_MS: u64 = 10_000;
 pub const DEFAULT_METRICS_ADDR: &str = "";
+pub const DEFAULT_PHP_BINARY: &str = "";
 
-/// MINIT 期注册三个 ini 项。
+/// MINIT 期注册 ini 项。
 pub fn register(module_number: i32) {
     IniEntryDef::register(
         vec![
@@ -50,6 +53,11 @@ pub fn register(module_number: i32) {
             IniEntryDef::new(
                 INI_METRICS_ADDR.into(),
                 DEFAULT_METRICS_ADDR.into(),
+                &IniEntryPermission::All,
+            ),
+            IniEntryDef::new(
+                INI_PHP_BINARY.into(),
+                DEFAULT_PHP_BINARY.into(),
                 &IniEntryPermission::All,
             ),
         ],
@@ -108,4 +116,9 @@ pub fn drain_timeout_ms() -> u64 {
 /// worker 不启动 metrics endpoint；显式给一个 `host:port` 才开。
 pub fn metrics_addr() -> Option<std::net::SocketAddr> {
     resolve_opt_str("HI_KAFKA_METRICS_ADDR", INI_METRICS_ADDR).and_then(|s| s.parse().ok())
+}
+
+/// 用来 exec worker 的 PHP CLI 可执行文件。未配置时由 spawn 自动探测。
+pub fn php_binary() -> Option<std::path::PathBuf> {
+    resolve_opt_str("HI_KAFKA_PHP_BINARY", INI_PHP_BINARY).map(std::path::PathBuf::from)
 }

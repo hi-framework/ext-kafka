@@ -100,7 +100,7 @@ one hi-kafka-worker per socket namespace
 - 从 librdkafka 后台线程直接调用 PHP；
 - 依赖 PHP GC 或定期重启作为正常内存治理；
 - 用 commit consumer current position 代替应用 ACK；
-- 在多线程 PHP 进程中继续执行不安全 fork。
+- 在多线程 PHP 进程中 fork 后不 exec 就运行 worker（仅作为 exec 不可用时的回退）。
 
 ## 5. 组件职责
 
@@ -205,18 +205,19 @@ worker 的唯一键是规范化后的 socket 路径。
 
 ### 6.2 worker 启动
 
-当前架构继续使用扩展内嵌 worker，但启动必须满足：
+worker 代码内嵌在扩展里，启动必须满足：
 
-- Swoole/Swow reactor 和第三方后台线程启动前 SHOULD 调用 ensureWorker；
 - 采用 double fork：中间进程只调用 async-signal-safe 的 `setsid`/`fork`/`write`/`_exit`，经 pipe 回报 worker PID 后退出并被 spawner 回收；worker 从启动起即被 init 收养，不成为 PHP-FPM / Swoole manager 的子进程；
+- 孙进程 fork 后 MUST 立即 `execve` 一个只加载本扩展的 PHP CLI（`hi-kafka-worker -n -d extension=<本 .so> -r '' -- <socket>`），fork 与 exec 之间只允许 async-signal-safe 调用；新进程的 MINIT 识别 `HI_KAFKA_INTERNAL_WORKER_SOCKET` 后进入 worker 且永不返回 PHP。日志、drain、metrics 等配置由父进程解析后以环境变量传入；
+- PHP CLI 的选择：`hi_kafka.php_binary` / `HI_KAFKA_PHP_BINARY` 显式指定优先；否则当前进程本身是 PHP CLI 时用它自己（同一构建，扩展 ABI 一定匹配）；FPM 等其它 SAPI 时取同一安装下的 `php`；
 - fork 子进程不得调用 PHP API；
 - worker MUST 在任何其它动作之前关闭全部继承的 fd（≥ 3）并清空信号屏蔽字，随后重置信号处理器、stdio 和 runtime；
 - worker readiness 只有在监听 socket、runtime 和协议 HELLO 全部可用后成立；
 - 在就绪期限内未完成 HELLO 的 worker MUST 被 spawner SIGKILL，下一次 ensure 重新拉起。
 
-多线程进程中的 fork：子进程可能继承其它线程持有的锁（malloc 等）而死锁。默认策略是允许 fork、记录 warning，并依赖「就绪超时即 SIGKILL」把最坏情况限定为一次有界的启动失败；`HI_KAFKA_STRICT_FORK=1` 时严格拒绝。
+多线程进程中的 fork：fork 出的子进程只有调用线程，其它线程持有的锁（malloc 等）永远不会释放。exec 换掉整个地址空间，这些锁随之作废，因此 Swoole / Swow / Workerman / ReactPHP / FPM 在任何时刻懒加载拉起 worker 都是安全的，不需要业务在线程启动前调用 ensureWorker（预热仍可用于消除首次调用的冷启动延迟）。
 
-不采用默认 fail closed 的原因：worker 崩溃后的惰性恢复通常发生在 Swoole worker 进程中，而 Linux 上 Swoole worker 一旦使用过协程文件 IO 就带有异步线程池。拒绝 fork 会让 Kafka 在进程重启前一直不可用，可用性损失大于一次可回收的启动失败。框架 SHOULD 在 reactor 启动前于 master 中 ensure，使惰性 fork 只作为恢复路径。
+回退：找不到 PHP CLI 或 exec 失败时，孙进程直接在 fork 出的进程中运行 worker，并记录 warning。此时多线程进程中仍有死锁风险，由「就绪超时即 SIGKILL」把最坏情况限定为一次有界的启动失败；`HI_KAFKA_STRICT_FORK=1` 时在多线程进程中拒绝这种回退。默认不拒绝的原因：worker 崩溃后的惰性恢复通常发生在 Swoole worker 进程中，拒绝会让 Kafka 在进程重启前一直不可用。
 
 ### 6.3 PHP fork 安全
 

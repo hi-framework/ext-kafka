@@ -118,7 +118,7 @@ Blocking、Swoole 和 Swow 都使用独立 Consumer stream、相同 frame codec�
 
 worker 崩溃或被其它进程重启后，三种 Client 都会自动恢复：重新探测 / 拉起 worker，收到 `CLUSTER_NOT_REGISTERED` 时重放本进程注册过的集群与 OAuth token，然后重试一次（超时不重试，结果未知）。fork 后子进程自动丢弃继承的连接。
 
-建议在 Swoole/Swow reactor 启动前（master 进程中）调用一次 `ensureWorker()`：worker 由扩展 double fork 拉起，多线程进程中 fork 有继承锁导致死锁的风险，超时未就绪的 worker 会被杀掉并在下次 ensure 时重试。
+worker 在第一次使用时自动拉起，任何运行时、任何时刻都可以：扩展 double fork 后立即 exec 一个只加载本扩展的 PHP CLI（`ps` 中显示为 `hi-kafka-worker -n -d extension=... -- <socket>`），不继承业务进程的线程、锁和内存。PHP CLI 默认使用当前进程自身（FPM 下为同一安装的 `php`），也可以用 `hi_kafka.php_binary` / `HI_KAFKA_PHP_BINARY` 指定；找不到时退回为在 fork 出的进程中运行 worker，并记录 warning。需要消除首次调用的冷启动延迟时，可以在启动阶段调用一次 `ensureWorker()` 预热。
 
 ## 内存预算
 

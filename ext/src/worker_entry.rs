@@ -1,8 +1,13 @@
 //! Worker 在 .so 内的入口点。
 //!
-//! 用 `libc::fork()` 拉起 worker 时，父进程立刻返回 PHP，
-//! 子进程直接调 [`run_in_child`]，在同一个 .so 镜像内启动 tokio + server，
-//! **不再 exec 外部二进制**。
+//! 正常路径：spawn 在 fork 出的孙进程里 exec 一个只加载本扩展的 PHP CLI
+//! （`php -n -d extension=<本 .so>`），并通过 [`EXEC_SOCKET_ENV`] 传入 socket。新进程
+//! 的 MINIT 看到该变量后调用 [`exec_config_from_env`] 与 [`run_in_child`]，不再返回。
+//! exec 换掉了整个地址空间，fork 时其它线程持有的锁随之作废，因此在任何运行时、
+//! 任何时刻懒加载拉起 worker 都是安全的。
+//!
+//! 回退路径：找不到 PHP CLI 或 exec 失败时，孙进程直接调 [`run_in_child`]，在 fork
+//! 出的进程里运行 worker（旧行为）。
 //!
 //! 子进程做的事：
 //! 0. 关闭继承的全部 fd，清空信号屏蔽字
@@ -21,7 +26,7 @@ use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::signal::unix::{signal, SignalKind};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Clone)]
@@ -31,21 +36,51 @@ pub struct ChildConfig {
     pub log_file: Option<PathBuf>,
     pub drain_timeout: Duration,
     pub metrics_addr: Option<std::net::SocketAddr>,
+    pub launch: Launch,
 }
 
-// `ChildConfig` 的构造由 `spawn.rs::to_child_config` 完成（从已解析的 `SpawnConfig`
-// 字段转发）。原来这里有过一个 `from_env(socket)` 全部从环境变量直读的版本，
-// 但 fork-in-MINIT 路径上 SpawnConfig 已经在父进程里解析过环境变量，没必要再读一遍，
-// 已删除。
+/// worker 是怎样启动的，只用于启动日志，便于排查是否走了回退路径。
+#[derive(Debug, Clone)]
+pub enum Launch {
+    /// fork 后 exec 了 PHP CLI，运行在全新的进程镜像中。
+    Exec,
+    /// 无法 exec（原因见字段），直接运行在 fork 出的进程中。
+    InProcess { reason: String },
+    /// exec 调用失败（errno），回退为运行在 fork 出的进程中。
+    ExecFailed { errno: i32 },
+}
 
-/// **不返回**——子进程在此处完成所有工作并 `_exit()`。
+/// exec 路径上由父进程设置、交给新进程 MINIT 的 socket 路径。存在即表示「本进程是
+/// worker」。其余配置（日志、drain、metrics）由父进程解析后以各自的环境变量传入。
+pub const EXEC_SOCKET_ENV: &str = "HI_KAFKA_INTERNAL_WORKER_SOCKET";
+
+/// exec 出的 worker 进程在 MINIT 中调用：读取父进程传入的配置。非 worker 进程返回 `None`。
+pub fn exec_config_from_env() -> Option<ChildConfig> {
+    let socket = std::env::var_os(EXEC_SOCKET_ENV).filter(|v| !v.is_empty())?;
+    let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    Some(ChildConfig {
+        socket: PathBuf::from(socket),
+        log_level: env("HI_KAFKA_LOG_LEVEL").unwrap_or_else(|| "info".to_string()),
+        log_file: env("HI_KAFKA_LOG_FILE").map(PathBuf::from),
+        drain_timeout: Duration::from_millis(
+            env("HI_KAFKA_DRAIN_TIMEOUT_MS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(crate::ini_config::DEFAULT_DRAIN_TIMEOUT_MS),
+        ),
+        metrics_addr: env("HI_KAFKA_METRICS_ADDR").and_then(|v| v.parse().ok()),
+        launch: Launch::Exec,
+    })
+}
+
+/// **不返回**——worker 在此处完成所有工作并 `_exit()`。
 ///
-/// 必须确保进入此函数前是 fork 之后的子进程语境（即 `libc::fork()` 返回 0 的分支）。
+/// 两种调用语境：exec 出的新进程的 MINIT（正常路径），或 exec 不可用时 fork 出的
+/// 孙进程（回退路径）。
 ///
 /// # Safety
 ///
-/// - 调用方负责确保已在子进程语境
-/// - 调用方负责在 fork 后 setsid 之前不要调用任何 PHP 函数
+/// - 调用方负责确保处于上述两种语境之一：本函数会关闭全部继承的 fd 并永不返回
+/// - 回退路径上调用方负责在 fork 后不要调用任何 PHP 函数
 pub unsafe fn run_in_child(config: ChildConfig) -> ! {
     // 0. 关闭继承自 PHP 的全部 fd（监听端口、数据库/Redis 连接、spawn 锁……）。
     //    worker 是长驻进程：继承的监听 socket 会让 PHP 服务重启时端口被占用，继承的
@@ -106,8 +141,20 @@ pub unsafe fn run_in_child(config: ChildConfig) -> ! {
     info!(
         version = env!("CARGO_PKG_VERSION"),
         socket = %config.socket.display(),
+        launch = ?config.launch,
         "hi-kafka worker (embedded in .so) starting"
     );
+    const FORKED_COPY: &str = "worker runs in a forked copy of the PHP process; if that \
+        process was multi-threaded the worker may deadlock and is then killed after the \
+        ready timeout. Set hi_kafka.php_binary to a PHP CLI binary to enable exec.";
+    match &config.launch {
+        Launch::Exec => {}
+        Launch::InProcess { reason } => warn!(exec_unavailable = %reason, "{FORKED_COPY}"),
+        Launch::ExecFailed { errno } => warn!(
+            exec_error = %std::io::Error::from_raw_os_error(*errno),
+            "{FORKED_COPY}"
+        ),
+    }
 
     // 6. glibc 上限制 malloc arena 数，必须在创建 tokio / librdkafka 线程之前。
     hi_kafka_worker::allocator::limit_malloc_arenas();

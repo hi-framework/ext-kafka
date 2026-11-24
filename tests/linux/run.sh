@@ -87,7 +87,7 @@ for suite in "$@"; do
         e2e)
             run_in "$IMAGE" env EXT_PATH=$EXT PHP_EXTRA_ARGS="$PHP_BASE" ./scripts/run-all-e2e.sh
             run_in "$IMAGE" env EXT_PATH=$EXT PHP_EXTRA_ARGS="$PHP_BASE -d extension=swoole" \
-                E2E_TESTS="consumer-record-memory-swoole-v2 coroutine-consumer-stream-v2 client-recovery-v2 binary-roundtrip-v2" \
+                E2E_TESTS="consumer-record-memory-swoole-v2 coroutine-consumer-stream-v2 client-recovery-v2 binary-roundtrip-v2 worker-exec-v2" \
                 ./scripts/run-all-e2e.sh
             ;;
         soak)
