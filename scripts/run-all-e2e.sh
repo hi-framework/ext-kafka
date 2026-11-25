@@ -86,6 +86,9 @@ cleanup_worker() {
     rm -f "$sock" "${sock}.pid" "${sock}.spawn-lock"
 }
 
+# 测试脚本的通过结论行（tests/linux/run.sh 对单独运行的用例用同一规则）。
+PASS_LINE='^★ .* PASS( |$)'
+
 pass=0
 fail=0
 failed_tests=()
@@ -111,7 +114,9 @@ for t in $TESTS; do
     end=$(now_ms)
     elapsed_ms=$(( end - start ))
 
-    if [[ $rc -eq 0 ]] && echo "$output" | grep -qE '★|PASS$|全部 PASS'; then
+    # 通过 = 退出码 0 且有一行以「★ 」开头、含 PASS 的结论行。只找 ★ 不够：脚本损坏
+    # （例如缺 <?php）时 PHP 会把源码原样输出并以 0 退出，源码里同样有 ★。
+    if [[ $rc -eq 0 ]] && echo "$output" | grep -qE "$PASS_LINE"; then
         echo "$(green PASS) (${elapsed_ms}ms)"
         pass=$((pass + 1))
     elif [[ $rc -eq 0 ]] && echo "$output" | grep -q '^SKIP:'; then

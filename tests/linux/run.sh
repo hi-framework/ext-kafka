@@ -94,7 +94,8 @@ for suite in "$@"; do
                 tests/php/worker-zombie-v2.php /tmp/worker-zombie.sock worker-zombie 2>&1) || {
                 echo "$zombie_out"; echo "worker-zombie-v2 FAIL" >&2; exit 1; }
             echo "$zombie_out"
-            grep -q '★' <<< "$zombie_out" || { echo "worker-zombie-v2 did not PASS" >&2; exit 1; }
+            # 同 run-all-e2e.sh 的 PASS_LINE：只认以「★ 」开头的结论行。
+            grep -qE '^★ .* PASS( |$)' <<< "$zombie_out" || { echo "worker-zombie-v2 did not PASS" >&2; exit 1; }
             ;;
         soak)
             out="/results/soak-${TAG}-$(date +%Y%m%d-%H%M%S)"
