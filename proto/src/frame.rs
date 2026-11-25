@@ -43,9 +43,10 @@ pub enum FrameType {
     Error = 0x40,
     /// worker 即将停机通知
     ShutdownNotice = 0x41,
-    /// 客户端告别（PHP 进程退出时主动发）：fire-and-forget，无 payload。
+    /// 客户端告别（PHP 进程退出时主动发），payload 见 [`crate::Goodbye`]。
     /// worker 收到后若此连接关闭即成最后一个连接且无活跃订阅，则立即自退，
     /// 不必等 idle 超时。发送失败 / worker 已死 → 退化回 idle 自退。
+    /// 带 `flush_wait_ms` 时 worker 以同类型帧应答（[`crate::GoodbyeResp`]）。
     Goodbye = 0x42,
     /// v2 Consumer：建立专用 stream。
     ConsumeOpen = 0x50,

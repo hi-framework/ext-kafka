@@ -42,6 +42,7 @@ ALL_TESTS=(
     consumer-cooperative-v2
     worker-spawn-v2
     worker-exec-v2
+    worker-goodbye-flush-v2
     client-fork-v2
     worker-drain-v2
     panic-recovery

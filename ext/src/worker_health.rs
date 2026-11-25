@@ -12,7 +12,9 @@
 use crate::spawn;
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 static KNOWN_ALIVE: OnceLock<Mutex<HashMap<PathBuf, ()>>> = OnceLock::new();
 
@@ -29,6 +31,15 @@ static EVER_ENSURED: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
 
 fn ever_ensured() -> &'static Mutex<BTreeSet<String>> {
     EVER_ENSURED.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+/// 最近一次成功 ensure 时的 drain 超时（毫秒），供 MSHUTDOWN 的 GOODBYE 等待预算使用：
+/// 模块关闭阶段不再读取 INI。
+static DRAIN_TIMEOUT_MS: AtomicU64 = AtomicU64::new(crate::ini_config::DEFAULT_DRAIN_TIMEOUT_MS);
+
+/// MSHUTDOWN 告别时等待 worker 发完消息的上限。
+pub fn goodbye_flush_wait() -> Duration {
+    Duration::from_millis(DRAIN_TIMEOUT_MS.load(Ordering::Relaxed))
 }
 
 /// 本进程曾确保过的所有 worker socket 快照。进程退出主动退出协调用（[`crate::lifecycle`]）。
@@ -65,6 +76,10 @@ pub fn ensure(socket: &str) -> Result<EnsureOutcome, spawn::SpawnError> {
     let cfg = spawn::SpawnConfig::from_env(key.clone());
     let outcome = spawn::ensure_worker(&cfg)?;
     cache().lock().unwrap().insert(key, ());
+    DRAIN_TIMEOUT_MS.store(
+        u64::try_from(cfg.drain_timeout.as_millis()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
     // 记下「曾确保过」的 socket（仅在成功后）。即便后续 invalidate，这里也保留，
     // 供 MSHUTDOWN 主动退出对该 worker 发 Goodbye——尤其覆盖只调 ensure_worker、
     // 不进 Rust 连接池的 Swoole/Swow driver。

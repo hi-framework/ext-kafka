@@ -111,6 +111,11 @@ pub fn worker_alive(socket: &Path) -> bool {
 
 /// 直连 socket 并完成 HELLO 握手（RPC 角色）。任一步失败返回 `None`。
 pub fn handshake(socket: &Path, timeout: Duration) -> Option<UnixStream> {
+    handshake_with_capabilities(socket, timeout).map(|(stream, _)| stream)
+}
+
+/// 同 [`handshake`]，另返回 worker 声明的 capabilities。
+pub fn handshake_with_capabilities(socket: &Path, timeout: Duration) -> Option<(UnixStream, u64)> {
     let mut stream = crate::uds::connect(socket, timeout).ok()?;
     stream.set_read_timeout(Some(timeout)).ok()?;
     stream.set_write_timeout(Some(timeout)).ok()?;
@@ -128,8 +133,8 @@ pub fn handshake(socket: &Path, timeout: Duration) -> Option<UnixStream> {
     let mut full = vec![0u8; HEADER_LEN + payload_len];
     full[..HEADER_LEN].copy_from_slice(&header);
     stream.read_exact(&mut full[HEADER_LEN..]).ok()?;
-    protocol::parse_hello_resp(&full).ok()?;
-    Some(stream)
+    let capabilities = protocol::parse_hello_resp(&full).ok()?;
+    Some((stream, capabilities))
 }
 
 /// 主入口：保证 socket 后面有一个能响应的 worker。

@@ -1,3 +1,4 @@
+use crate::clients::{Clients, Connection};
 use crate::cluster::{ClusterRegistryHandle, StoredOAuthToken};
 use crate::consumer::{ConsumerError, ConsumerHandle, OutboundFrame};
 use crate::error::WorkerError;
@@ -10,14 +11,14 @@ use futures::FutureExt;
 use hi_kafka_proto::{
     codec, encode_frame, ConnectionRole, ConsumeAck, ConsumeClose, ConsumeCommit, ConsumeNack,
     ConsumeOpen, ConsumeResume, ConsumerPartitions, DeliveryAck, ErrorKind, ErrorResp, FlowControl,
-    FrameType, HelloReq, HelloResp, ProduceFnf, ProduceReq, ProduceResp, RegisterClusterReq,
-    RegisterClusterResp, SetOAuthBearerTokenReq, SetOAuthBearerTokenResp, CAP_ALL,
-    CAP_CONSUMER_STREAM, HEADER_LEN, MAX_PAYLOAD_LEN, PROTOCOL_MAJOR,
+    FrameType, Goodbye, GoodbyeResp, HelloReq, HelloResp, ProduceFnf, ProduceReq, ProduceResp,
+    RegisterClusterReq, RegisterClusterResp, SetOAuthBearerTokenReq, SetOAuthBearerTokenResp,
+    CAP_ALL, CAP_CONSUMER_STREAM, CAP_GOODBYE_FLUSH, HEADER_LEN, MAX_PAYLOAD_LEN, PROTOCOL_MAJOR,
 };
 use std::io::IoSlice;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -180,7 +181,8 @@ impl Server {
         // 含义：「Goodbye 之后没有新使用者到来」。配合「最后一个连接关闭」判定，让
         // worker 在最后的使用者离开时立即自退，而不必等满 idle_timeout；Goodbye 之后
         // 接入、未告别就断开的使用者仍走 idle 超时。仅在启用 idle 自退时生效。
-        let expedited = Arc::new(AtomicBool::new(false));
+        // `clients.expedited` 即上述标志；连接登记另用于 GOODBYE 判断最后的使用者。
+        let clients = Clients::new(drain_timeout);
         // idle 检查间隔：idle_timeout 的 1/4，夹在 [1s, 30s]。禁用时给个无害的 30s。
         let check_interval = if idle_timeout.is_zero() {
             Duration::from_secs(30)
@@ -210,16 +212,17 @@ impl Server {
                     match res {
                         Ok((stream, _addr)) => {
                             debug!("client connected");
-                            expedited.store(false, Ordering::Release);
+                            clients.expedited.store(false, Ordering::Release);
+                            let connection =
+                                clients.register(stream.peer_cred().ok().and_then(|c| c.pid()));
                             Metrics::inc(&self.metrics.ipc_connections_total);
                             let producer = self.producer.clone();
                             let consumer = self.consumer.clone();
                             let registry = self.registry.clone();
                             let shutdown = self.shutdown.clone();
                             let metrics = self.metrics.clone();
-                            let expedited = expedited.clone();
                             tasks.spawn(async move {
-                                if let Err(e) = handle_connection(stream, producer, consumer, registry, shutdown, metrics, expedited).await {
+                                if let Err(e) = handle_connection(stream, producer, consumer, registry, shutdown, metrics, connection).await {
                                     warn!(error = ?e, "connection ended with error");
                                 }
                             });
@@ -237,7 +240,7 @@ impl Server {
                     // 连接关闭」的时刻被跳过，Goodbye 快速退出因此失效。
                     if !idle_timeout.is_zero()
                         && tasks.is_empty()
-                        && expedited.load(Ordering::Acquire)
+                        && clients.expedited.load(Ordering::Acquire)
                         && self.consumer.active_subscriptions().await == 0
                     {
                         info!("client goodbye + last connection closed, self-terminating");
@@ -330,7 +333,7 @@ async fn handle_connection(
     registry: ClusterRegistryHandle,
     shutdown: ShutdownHandle,
     metrics: Arc<Metrics>,
-    expedited: Arc<AtomicBool>,
+    connection: Connection,
 ) -> anyhow::Result<()> {
     let mut header_buf = [0u8; HEADER_LEN];
     let mut payload_buf = BytesMut::new();
@@ -409,7 +412,7 @@ async fn handle_connection(
             }
             let resp = HelloResp {
                 major: PROTOCOL_MAJOR,
-                capabilities: CAP_ALL,
+                capabilities: CAP_ALL | CAP_GOODBYE_FLUSH,
             };
             let mut resp_buf = BytesMut::new();
             resp.encode(&mut resp_buf).context("encode HELLO resp")?;
@@ -451,7 +454,7 @@ async fn handle_connection(
             &registry,
             &shutdown,
             &metrics,
-            &expedited,
+            &connection,
         )
         .await?;
         release_oversized(&mut payload_buf);
@@ -692,10 +695,10 @@ async fn dispatch(
     registry: &ClusterRegistryHandle,
     shutdown: &ShutdownHandle,
     metrics: &Arc<Metrics>,
-    expedited: &Arc<AtomicBool>,
+    connection: &Connection,
 ) -> anyhow::Result<()> {
     let result = AssertUnwindSafe(dispatch_inner(
-        stream, kind, cid, payload, producer, consumer, registry, shutdown, metrics, expedited,
+        stream, kind, cid, payload, producer, consumer, registry, shutdown, metrics, connection,
     ))
     .catch_unwind()
     .await;
@@ -719,7 +722,7 @@ async fn dispatch_inner(
     registry: &ClusterRegistryHandle,
     shutdown: &ShutdownHandle,
     metrics: &Arc<Metrics>,
-    expedited: &Arc<AtomicBool>,
+    connection: &Connection,
 ) -> anyhow::Result<()> {
     match kind {
         FrameType::Hello => {
@@ -751,12 +754,25 @@ async fn dispatch_inner(
             handle_set_oauth_token(stream, cid, payload, registry).await?;
         }
         FrameType::Goodbye => {
-            // 客户端（PHP 进程）主动告别，fire-and-forget，无响应。置位 expedited：
-            // 此连接关闭后若已无其它连接且无活跃订阅，主循环立即自退（见 run() 的
-            // join_next 分支）。worker 是节点级共享单例，这里**不**直接 drain——
-            // 必须等「最后一个连接关闭」的判定，避免误杀仍在使用的其它进程。
+            // 客户端（PHP 进程）主动告别。置位 expedited：此连接关闭后若已无其它连接且
+            // 无活跃订阅，主循环立即自退（见 run() 的 join_next 分支）。worker 是节点级
+            // 共享单例，这里**不**直接 drain——必须等「最后一个连接关闭」的判定，避免
+            // 误杀仍在使用的其它进程。
             debug!(cid, "client goodbye received; marking expedited shutdown");
-            expedited.store(true, Ordering::Release);
+            connection
+                .clients()
+                .expedited
+                .store(true, Ordering::Release);
+            // 带等待预算时：最后的使用者先等消息发完再应答（见 crate::clients）。
+            let goodbye = Goodbye::decode(payload).context("decode GOODBYE")?;
+            if let Some(ms) = goodbye.flush_wait_ms {
+                let flushed = connection
+                    .settle_goodbye(Duration::from_millis(u64::from(ms)), producer)
+                    .await;
+                let mut resp = BytesMut::new();
+                GoodbyeResp { flushed }.encode(&mut resp)?;
+                write_frame(stream, FrameType::Goodbye, cid, &resp).await?;
+            }
         }
         other => {
             warn!(kind = ?other, cid, "invalid frame on RPC connection");

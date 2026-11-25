@@ -10,6 +10,7 @@
 pub mod allocator;
 #[cfg(feature = "kafka")]
 pub mod broker_watchdog;
+pub mod clients;
 pub mod cluster;
 pub mod consumer;
 pub mod error;

@@ -13,12 +13,17 @@
 //! - **绝不 spawn**：只 `UnixStream::connect` 现有 socket，连不上即放弃（worker 已不在，
 //!   本就无需清理）。**不**走 `ipc::ensure` / `spawn`——进程退出期 fork 既危险又无意义。
 //! - **有界**：connect 对 UDS 近乎即时；读写各设 300ms 超时，worker 卡住也不拖慢退出。
+//!   唯一的例外是等待 GOODBYE 应答：若本进程是 worker 最后的使用者，worker 先把已收下
+//!   的消息发往 broker 再应答，上限为 drain 超时（默认 10s）。CLI 定时任务 / 容器
+//!   1 号进程退出时 worker 会被一起杀掉，不等待就会丢掉还没发出的 fire-and-forget
+//!   消息；还有其它进程在用 worker 时（FPM、Swoole 多进程）worker 立即应答。
 //! - **不依赖 PHP**：纯 Rust + UDS，不调任何 PHP API。
 
 use crate::pool;
 use crate::protocol;
+use hi_kafka_proto::{CAP_GOODBYE_FLUSH, HEADER_LEN};
 use std::collections::BTreeSet;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
@@ -50,7 +55,7 @@ fn collect_sockets() -> Vec<String> {
     set.into_iter().collect()
 }
 
-/// 对单个 socket 的告别清理：关空闲 RPC 连接 → 直连握手 → 发 Goodbye。
+/// 对单个 socket 的告别清理：关空闲 RPC 连接 → 直连握手 → 发 Goodbye（→ 等应答）。
 fn cleanup_socket(socket: &str) {
     // 1. 关本进程在该 socket 的空闲池连接。否则它们在进程真正退出前仍 open，
     //    会让 worker 误以为还有使用者、迟迟判不出「最后一个连接关闭」。
@@ -58,22 +63,49 @@ fn cleanup_socket(socket: &str) {
 
     // 2. 直连 + 握手（绝不 spawn）。ConsumerStream objects own and close
     // their leases directly; module shutdown only coordinates the RPC owner.
-    let mut stream = match connect_and_handshake(socket) {
-        Some(s) => s,
-        None => return,
+    let Some((mut stream, capabilities)) = connect_and_handshake(socket) else {
+        return;
     };
 
-    // 3. Goodbye（fire-and-forget）。worker 收到后，待本连接关闭即判定是否最后一个。
-    if let Ok(frame) = protocol::build_goodbye_frame() {
-        let _ = write_all(&mut stream, &frame);
+    // 3. Goodbye。worker 收到后，待本连接关闭即判定是否最后一个。旧 worker 不支持等待，
+    //    只发告别。
+    let wait = (capabilities & CAP_GOODBYE_FLUSH != 0)
+        .then(crate::worker_health::goodbye_flush_wait)
+        .filter(|wait| !wait.is_zero());
+    let wait_ms = wait.map(|wait| u32::try_from(wait.as_millis()).unwrap_or(u32::MAX));
+    let Ok(frame) = protocol::build_goodbye_frame(wait_ms) else {
+        return;
+    };
+    if write_all(&mut stream, &frame).is_err() {
+        return;
+    }
+    if let Some(wait) = wait {
+        // worker 自己把等待限制在预算内；这里多留余量，只防 worker 卡死。
+        let _ = stream.set_read_timeout(Some(wait + GOODBYE_REPLY_MARGIN));
+        let _ = read_goodbye_resp(&mut stream);
     }
     // drop(stream)：连接立即关闭 → worker 端 EOF → 触发「最后一个连接关闭」判定。
 }
 
+/// GOODBYE 应答相对等待预算的余量。
+const GOODBYE_REPLY_MARGIN: Duration = Duration::from_secs(1);
+
+fn read_goodbye_resp(stream: &mut UnixStream) -> Option<bool> {
+    let mut frame = vec![0u8; HEADER_LEN];
+    stream.read_exact(&mut frame).ok()?;
+    let header = protocol::parse_header_only(&frame).ok()?;
+    if header.payload_len > 64 {
+        return None;
+    }
+    frame.resize(HEADER_LEN + header.payload_len as usize, 0);
+    stream.read_exact(&mut frame[HEADER_LEN..]).ok()?;
+    protocol::parse_goodbye_resp(&frame).ok()
+}
+
 /// 直连 socket 并完成 HELLO 握手（绝不 spawn、不复用池连接）。这里要一个独立、
 /// 发完即关的连接，使 worker 能干净捕捉到它的关闭。
-fn connect_and_handshake(socket: &str) -> Option<UnixStream> {
-    crate::spawn::handshake(Path::new(socket), IO_TIMEOUT)
+fn connect_and_handshake(socket: &str) -> Option<(UnixStream, u64)> {
+    crate::spawn::handshake_with_capabilities(Path::new(socket), IO_TIMEOUT)
 }
 
 fn write_all(stream: &mut UnixStream, buf: &[u8]) -> std::io::Result<()> {

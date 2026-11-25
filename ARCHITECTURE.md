@@ -873,7 +873,11 @@ Swow 与 Swoole 共用唯一的 `CoroutineConsumerStream` 状态机，只替换�
 - Consumer owner 主动发送 ConsumeClose；
 - 未 ACK delivery 保持未提交；
 - transaction owner 尝试 abort；
-- 发送 Goodbye；
+- 发送 Goodbye；worker 声明 `CAP_GOODBYE_FLUSH` 时带上等待预算（drain timeout，默认
+  10s）并等待应答。worker 按对端 PID（`SO_PEERCRED` / `LOCAL_PEERPID`）判断：没有
+  其它进程连着它时，先 flush Producer 再应答，因为 CLI 定时任务或容器 1 号进程退出后
+  worker 会随容器一起被 SIGKILL，不等待就会丢掉队列里的 fire-and-forget 消息；还有
+  其它进程（FPM、Swoole 多进程）时立即应答，不拖慢退出；
 - 不在 MSHUTDOWN 触发新 worker；
 - 清理失败由连接关闭和 worker lease timeout 兜底。
 

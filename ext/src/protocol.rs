@@ -4,10 +4,10 @@ use bytes::BytesMut;
 use hi_kafka_proto::{
     codec, encode_frame, ConnectionRole, ConsumeAck, ConsumeClose, ConsumeCommit, ConsumeCommitted,
     ConsumeMessage, ConsumeNack, ConsumeOpen, ConsumeReady, ConsumeResume, ConsumerPartitions,
-    ErrorResp, FlowControl, FrameType, HelloReq, HelloResp, MessageHeader, ProduceFields,
-    ProduceResp, RebalanceNotice, RegisterClusterReq, RegisterClusterResp, ResumeToken,
-    SetOAuthBearerTokenReq, SetOAuthBearerTokenResp, CAP_ALL, HEADER_LEN, PROTOCOL_MAJOR,
-    RESUME_TOKEN_LEN,
+    ErrorResp, FlowControl, FrameType, Goodbye, GoodbyeResp, HelloReq, HelloResp, MessageHeader,
+    ProduceFields, ProduceResp, RebalanceNotice, RegisterClusterReq, RegisterClusterResp,
+    ResumeToken, SetOAuthBearerTokenReq, SetOAuthBearerTokenResp, CAP_ALL, HEADER_LEN,
+    PROTOCOL_MAJOR, RESUME_TOKEN_LEN,
 };
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -58,7 +58,8 @@ pub fn build_hello_frame_for(role: ConnectionRole) -> anyhow::Result<Vec<u8>> {
         .encode(payload)
     })
 }
-pub fn parse_hello_resp(bytes: &[u8]) -> anyhow::Result<()> {
+/// 校验 HELLO 应答，返回 worker 声明的 capabilities。
+pub fn parse_hello_resp(bytes: &[u8]) -> anyhow::Result<u64> {
     let (header, payload) = split_frame(bytes)?;
     if header.kind != FrameType::Hello {
         anyhow::bail!("expected Hello, got {:?}", header.kind);
@@ -74,7 +75,7 @@ pub fn parse_hello_resp(bytes: &[u8]) -> anyhow::Result<()> {
     if value.capabilities & CAP_ALL != CAP_ALL {
         anyhow::bail!("worker lacks required v2 capabilities");
     }
-    Ok(())
+    Ok(value.capabilities)
 }
 
 /// 一次生产调用的全部字段（key / value 借用调用方的字节，不复制）。
@@ -167,8 +168,21 @@ pub fn parse_header_only(bytes: &[u8]) -> anyhow::Result<ParsedHeader> {
     })
 }
 
-pub fn build_goodbye_frame() -> anyhow::Result<Vec<u8>> {
-    encode_raw(FrameType::Goodbye, 0, &[])
+/// `flush_wait_ms` 为 `Some` 时 worker 会应答（见 [`parse_goodbye_resp`]）。
+pub fn build_goodbye_frame(flush_wait_ms: Option<u32>) -> anyhow::Result<Vec<u8>> {
+    encode(FrameType::Goodbye, 0, |payload| {
+        Goodbye { flush_wait_ms }.encode(payload)
+    })
+}
+/// 返回 worker 是否在应答前 flush 过 producer。
+pub fn parse_goodbye_resp(bytes: &[u8]) -> anyhow::Result<bool> {
+    let (header, payload) = split_frame(bytes)?;
+    if header.kind != FrameType::Goodbye {
+        anyhow::bail!("expected Goodbye, got {:?}", header.kind);
+    }
+    Ok(GoodbyeResp::decode(payload)
+        .map_err(|e| anyhow::anyhow!(e))?
+        .flushed)
 }
 pub fn build_register_cluster_frame(
     cluster: &str,

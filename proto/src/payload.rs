@@ -67,6 +67,9 @@ pub const MAX_MESSAGE_HEADERS: usize = 4_096;
 pub const CAP_PRODUCER: u64 = 1 << 0;
 pub const CAP_CONSUMER_STREAM: u64 = 1 << 1;
 pub const CAP_ALL: u64 = CAP_PRODUCER | CAP_CONSUMER_STREAM;
+/// worker 支持 [`Goodbye::flush_wait_ms`]：最后的使用者告别时等消息发完再应答。
+/// 不在 [`CAP_ALL`] 里：缺少它的旧 worker 仍可握手，客户端退回不等待的告别。
+pub const CAP_GOODBYE_FLUSH: u64 = 1 << 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -151,6 +154,61 @@ impl HelloResp {
             major: buf.get_u8(),
             capabilities: buf.get_u64(),
         })
+    }
+}
+
+/// GOODBYE payload：空 = 只告别；`[u32 flush_wait_ms]` = 若发送方是最后的使用者
+/// （没有其它进程连着 worker），worker 先把已收下的消息发往 broker（至多
+/// `flush_wait_ms`），再回一个带 [`GoodbyeResp`] 的 GOODBYE 帧。
+///
+/// 用于「PHP 进程退出后 worker 随容器一起被杀」的场景（CLI 定时任务、1 号进程）：
+/// 否则还在 librdkafka 队列里的 fire-and-forget 消息会丢失。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Goodbye {
+    pub flush_wait_ms: Option<u32>,
+}
+
+impl Goodbye {
+    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), PayloadError> {
+        if let Some(ms) = self.flush_wait_ms {
+            buf.put_u32(ms);
+        }
+        Ok(())
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self, PayloadError> {
+        match buf.len() {
+            0 => Ok(Self {
+                flush_wait_ms: None,
+            }),
+            4 => Ok(Self {
+                flush_wait_ms: Some(u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]])),
+            }),
+            _ => Err(PayloadError::Truncated),
+        }
+    }
+}
+
+/// GOODBYE 应答 payload：`[u8 flushed]`。`flushed = false` 表示还有其它进程在用
+/// worker，worker 会继续运行并发送消息，无需等待。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GoodbyeResp {
+    pub flushed: bool,
+}
+
+impl GoodbyeResp {
+    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), PayloadError> {
+        buf.put_u8(self.flushed as u8);
+        Ok(())
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self, PayloadError> {
+        match buf {
+            [flag] => Ok(Self {
+                flushed: *flag != 0,
+            }),
+            _ => Err(PayloadError::Truncated),
+        }
     }
 }
 
@@ -516,6 +574,29 @@ fn read_bytes_u32<B: Buf>(buf: &mut B) -> Result<Bytes, PayloadError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn goodbye_roundtrip() {
+        for value in [
+            Goodbye {
+                flush_wait_ms: None,
+            },
+            Goodbye {
+                flush_wait_ms: Some(10_000),
+            },
+        ] {
+            let mut buf = BytesMut::new();
+            value.encode(&mut buf).unwrap();
+            assert_eq!(Goodbye::decode(&buf).unwrap(), value);
+        }
+        assert!(Goodbye::decode(&[0, 1]).is_err());
+        for flushed in [false, true] {
+            let mut buf = BytesMut::new();
+            GoodbyeResp { flushed }.encode(&mut buf).unwrap();
+            assert_eq!(GoodbyeResp::decode(&buf).unwrap().flushed, flushed);
+        }
+        assert!(GoodbyeResp::decode(&[]).is_err());
+    }
 
     #[test]
     fn produce_fields_frame_matches_owned_encoding() {
