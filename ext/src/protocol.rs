@@ -82,8 +82,10 @@ pub fn parse_hello_resp(bytes: &[u8]) -> anyhow::Result<u64> {
 pub struct ProduceInput<'a> {
     pub cluster: &'a str,
     pub topic: &'a str,
-    pub key: &'a [u8],
-    pub value: &'a [u8],
+    /// `None` = null key
+    pub key: Option<&'a [u8]>,
+    /// `None` = null value（tombstone）
+    pub value: Option<&'a [u8]>,
     pub headers: &'a [MessageHeader],
     pub partition: i32,
     pub timestamp_ms: i64,

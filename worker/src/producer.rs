@@ -37,8 +37,8 @@ impl Producer for LoggingProducer {
         info!(
             cluster = %msg.cluster,
             topic = %msg.topic,
-            key_len = msg.key.len(),
-            value_len = msg.value.len(),
+            key_len = msg.key.as_ref().map(|k| k.len()),
+            value_len = msg.value.as_ref().map(|v| v.len()),
             "[LoggingProducer] PRODUCE_FNF (dry-run, kafka feature disabled)"
         );
         Ok(())
@@ -52,8 +52,8 @@ impl Producer for LoggingProducer {
         info!(
             cluster = %msg.cluster,
             topic = %msg.topic,
-            key_len = msg.key.len(),
-            value_len = msg.value.len(),
+            key_len = msg.key.as_ref().map(|k| k.len()),
+            value_len = msg.value.as_ref().map(|v| v.len()),
             "[LoggingProducer] PRODUCE_REQ (dry-run) → fake ACK"
         );
         Ok(ProduceResp::Ok(hi_kafka_proto::DeliveryAck {

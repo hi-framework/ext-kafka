@@ -216,8 +216,10 @@ impl GoodbyeResp {
 pub struct ProduceFnf {
     pub cluster: String,
     pub topic: String,
-    pub key: Bytes,
-    pub value: Bytes,
+    /// `None` = null key（线格式长度为 `u32::MAX`）
+    pub key: Option<Bytes>,
+    /// `None` = null value，即 tombstone（compacted topic 的删除标记）
+    pub value: Option<Bytes>,
     /// `-1` = auto（librdkafka partitioner，通常按 key hash）
     pub partition: i32,
     /// `-1` = auto（librdkafka 用系统当前 CreateTime）
@@ -230,8 +232,8 @@ impl Default for ProduceFnf {
         Self {
             cluster: String::new(),
             topic: String::new(),
-            key: Bytes::new(),
-            value: Bytes::new(),
+            key: Some(Bytes::new()),
+            value: Some(Bytes::new()),
             partition: AUTO_PARTITION,
             timestamp_ms: AUTO_TIMESTAMP,
             headers: Vec::new(),
@@ -246,8 +248,8 @@ impl Default for ProduceFnf {
 pub struct ProduceFields<'a> {
     pub cluster: &'a str,
     pub topic: &'a str,
-    pub key: &'a [u8],
-    pub value: &'a [u8],
+    pub key: Option<&'a [u8]>,
+    pub value: Option<&'a [u8]>,
     pub partition: i32,
     pub timestamp_ms: i64,
     pub headers: &'a [MessageHeader],
@@ -265,9 +267,9 @@ impl ProduceFields<'_> {
             + 2
             + self.topic.len()
             + 4
-            + self.key.len()
+            + self.key.map_or(0, <[u8]>::len)
             + 4
-            + self.value.len()
+            + self.value.map_or(0, <[u8]>::len)
             + 4
             + 8
             + 4
@@ -277,8 +279,8 @@ impl ProduceFields<'_> {
     pub fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), PayloadError> {
         write_str_u16(self.cluster, buf)?;
         write_str_u16(self.topic, buf)?;
-        write_bytes_u32(self.key, buf)?;
-        write_bytes_u32(self.value, buf)?;
+        write_nullable_bytes_u32(self.key, buf)?;
+        write_nullable_bytes_u32(self.value, buf)?;
         buf.put_i32(self.partition);
         buf.put_i64(self.timestamp_ms);
         write_headers(self.headers, buf)?;
@@ -324,8 +326,8 @@ impl ProduceFnf {
         ProduceFields {
             cluster: &self.cluster,
             topic: &self.topic,
-            key: &self.key,
-            value: &self.value,
+            key: self.key.as_deref(),
+            value: self.value.as_deref(),
             partition: self.partition,
             timestamp_ms: self.timestamp_ms,
             headers: &self.headers,
@@ -345,8 +347,8 @@ impl ProduceFnf {
     pub fn decode_buf<B: Buf>(mut buf: B) -> Result<Self, PayloadError> {
         let cluster = read_str_u16(&mut buf, "cluster")?;
         let topic = read_str_u16(&mut buf, "topic")?;
-        let key = read_bytes_u32(&mut buf)?;
-        let value = read_bytes_u32(&mut buf)?;
+        let key = read_nullable_bytes_u32(&mut buf)?;
+        let value = read_nullable_bytes_u32(&mut buf)?;
         if buf.remaining() < 4 + 8 {
             return Err(PayloadError::Truncated);
         }
@@ -418,8 +420,8 @@ impl ProduceReq {
     pub fn decode_buf<B: Buf>(mut buf: B) -> Result<Self, PayloadError> {
         let cluster = read_str_u16(&mut buf, "cluster")?;
         let topic = read_str_u16(&mut buf, "topic")?;
-        let key = read_bytes_u32(&mut buf)?;
-        let value = read_bytes_u32(&mut buf)?;
+        let key = read_nullable_bytes_u32(&mut buf)?;
+        let value = read_nullable_bytes_u32(&mut buf)?;
         if buf.remaining() < 4 + 8 {
             return Err(PayloadError::Truncated);
         }
@@ -559,6 +561,29 @@ pub(crate) fn read_str_u16<B: Buf>(
     String::from_utf8(bytes).map_err(|_| PayloadError::InvalidUtf8 { field })
 }
 
+/// 可为 null 的字节串：长度 `u32::MAX` 表示 null（与 stream 协议的消费记录一致）。
+fn write_nullable_bytes_u32<B: BufMut>(b: Option<&[u8]>, buf: &mut B) -> Result<(), PayloadError> {
+    match b {
+        Some(b) if b.len() >= u32::MAX as usize => Err(PayloadError::FieldTooLarge(b.len())),
+        Some(b) => write_bytes_u32(b, buf),
+        None => {
+            buf.put_u32(u32::MAX);
+            Ok(())
+        }
+    }
+}
+
+fn read_nullable_bytes_u32<B: Buf>(buf: &mut B) -> Result<Option<Bytes>, PayloadError> {
+    if buf.remaining() < 4 {
+        return Err(PayloadError::Truncated);
+    }
+    if buf.chunk().get(..4) == Some(&[0xff; 4][..]) {
+        buf.advance(4);
+        return Ok(None);
+    }
+    read_bytes_u32(buf).map(Some)
+}
+
 /// 对 [`Bytes`] 是零拷贝切片，对 `&[u8]` 复制一次。
 fn read_bytes_u32<B: Buf>(buf: &mut B) -> Result<Bytes, PayloadError> {
     if buf.remaining() < 4 {
@@ -603,8 +628,8 @@ mod tests {
         let msg = ProduceFnf {
             cluster: "c".into(),
             topic: "orders".into(),
-            key: Bytes::from_static(b"k\x00\xff"),
-            value: Bytes::from(vec![7u8; 3000]),
+            key: Some(Bytes::from_static(b"k\x00\xff")),
+            value: Some(Bytes::from(vec![7u8; 3000])),
             partition: 2,
             timestamp_ms: 1_700_000_000_000,
             headers: vec![("trace".into(), Bytes::from_static(b"\x01\x02"))],
@@ -643,8 +668,8 @@ mod tests {
         let fields = ProduceFields {
             cluster: "c",
             topic: "t",
-            key: b"",
-            value: &value,
+            key: Some(b""),
+            value: Some(&value),
             partition: AUTO_PARTITION,
             timestamp_ms: AUTO_TIMESTAMP,
             headers: &[],
@@ -687,12 +712,35 @@ mod tests {
     }
 
     #[test]
+    fn produce_null_key_and_tombstone_roundtrip() {
+        for (key, value) in [
+            (None, None),
+            (None, Some(Bytes::from_static(b"v"))),
+            (Some(Bytes::new()), None),
+            (Some(Bytes::new()), Some(Bytes::new())),
+        ] {
+            let original = ProduceFnf {
+                cluster: "default".into(),
+                topic: "compacted".into(),
+                key,
+                value,
+                ..Default::default()
+            };
+            let mut buf = BytesMut::new();
+            original.encode(&mut buf).unwrap();
+            assert_eq!(buf.len(), original.fields().encoded_len());
+            assert_eq!(ProduceFnf::decode(&buf).unwrap(), original);
+            assert_eq!(ProduceFnf::decode_buf(buf.freeze()).unwrap(), original);
+        }
+    }
+
+    #[test]
     fn test_produce_fnf_roundtrip() {
         let original = ProduceFnf {
             cluster: "default".into(),
             topic: "orders".into(),
-            key: Bytes::from_static(b"user-42"),
-            value: Bytes::from_static(b"{\"amount\":100}"),
+            key: Some(Bytes::from_static(b"user-42")),
+            value: Some(Bytes::from_static(b"{\"amount\":100}")),
             ..Default::default()
         };
         let mut buf = BytesMut::new();
@@ -709,8 +757,8 @@ mod tests {
         let original = ProduceFnf {
             cluster: "default".into(),
             topic: "orders".into(),
-            key: Bytes::from_static(b"user-42"),
-            value: Bytes::from_static(b"v"),
+            key: Some(Bytes::from_static(b"user-42")),
+            value: Some(Bytes::from_static(b"v")),
             partition: 3,
             timestamp_ms: 1_700_000_000_000,
             headers: vec![],
@@ -725,8 +773,8 @@ mod tests {
         let original = ProduceFnf {
             cluster: "default".into(),
             topic: "orders".into(),
-            key: Bytes::from_static(b"k"),
-            value: Bytes::from_static(b"v"),
+            key: Some(Bytes::from_static(b"k")),
+            value: Some(Bytes::from_static(b"v")),
             headers: vec![
                 (
                     "traceparent".into(),
@@ -754,8 +802,8 @@ mod tests {
         let original = ProduceFnf {
             cluster: "c".into(),
             topic: "t".into(),
-            key: Bytes::new(),
-            value: Bytes::new(),
+            key: Some(Bytes::new()),
+            value: Some(Bytes::new()),
             ..Default::default()
         };
         let mut buf = BytesMut::new();
@@ -770,8 +818,8 @@ mod tests {
             msg: ProduceFnf {
                 cluster: "default".into(),
                 topic: "orders".into(),
-                key: Bytes::from_static(b"k"),
-                value: Bytes::from_static(b"v"),
+                key: Some(Bytes::from_static(b"k")),
+                value: Some(Bytes::from_static(b"v")),
                 headers: vec![("h".into(), Bytes::from_static(b"x"))],
                 ..Default::default()
             },

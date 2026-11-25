@@ -61,10 +61,16 @@ impl Metrics {
     }
 
     pub fn sub(counter: &AtomicU64, value: u64) {
-        let result = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            Some(current.saturating_sub(value))
-        });
-        debug_assert!(result.is_ok());
+        // 不用 fetch_update：新版 stable 已废弃它，替代的 try_update 在旧工具链上还没有。
+        let mut current = counter.load(Ordering::Relaxed);
+        while let Err(actual) = counter.compare_exchange_weak(
+            current,
+            current.saturating_sub(value),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            current = actual;
+        }
     }
 
     pub fn uptime_seconds(&self) -> u64 {

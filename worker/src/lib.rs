@@ -15,6 +15,7 @@ pub mod cluster;
 pub mod consumer;
 pub mod error;
 pub mod metrics;
+pub mod peer;
 pub mod producer;
 pub mod server;
 pub mod shutdown;

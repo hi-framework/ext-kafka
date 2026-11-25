@@ -193,6 +193,15 @@ pub fn hi_kafka_ensure_worker(socket: Option<String>) -> PhpResult<()> {
     Ok(())
 }
 
+/// 协程 driver 连接 worker 前检查 socket 文件属主：属于其它用户（且不是 root）时
+/// 抛异常，不把凭据和消息发给别人抢先监听的 socket。Rust 侧的连接在 connect 后直接
+/// 校验对端 uid，见 `hi_kafka_worker::peer`。
+#[php_function]
+pub fn hi_kafka_check_socket_owner(socket: String) -> PhpResult<()> {
+    hi_kafka_worker::peer::check_socket_owner(std::path::Path::new(&socket))
+        .map_err(|e| PhpException::default(e.to_string()))
+}
+
 /// 注册或覆盖一个 Kafka 集群。
 ///
 /// `$config` 必须包含 `bootstrap.servers`，其它键值原样透传给 librdkafka。
@@ -217,15 +226,17 @@ pub fn hi_kafka_register_cluster(
 /// Fire-and-forget 全局函数 API。
 ///
 /// 高级选项（全部可选，缺省 None 表示由 librdkafka 自动决定）：
+/// - `$key` / `$value` 必填，可为 `null`（null key / tombstone）
 /// - `$headers`：Kafka 消息头（关联数组）
 /// - `$partition`：明确写入分区编号；`null`/缺省 = 走 partitioner（key hash）
 /// - `$timestampMs`：消息时间戳（毫秒）；`null`/缺省 = librdkafka 当前时间
 #[php_function]
+#[php(optional = headers)]
 pub fn hi_kafka_produce_fnf(
     cluster: &str,
     topic: &str,
-    key: BinarySlice<u8>,
-    value: BinarySlice<u8>,
+    key: Option<BinarySlice<u8>>,
+    value: Option<BinarySlice<u8>>,
     headers: Option<&ZendHashTable>,
     partition: Option<i64>,
     timestamp_ms: Option<i64>,
@@ -233,16 +244,25 @@ pub fn hi_kafka_produce_fnf(
 ) -> PhpResult<()> {
     let socket = resolve_socket(socket.as_deref());
     let opts = build_options(headers, partition, timestamp_ms)?;
-    ipc::produce_fnf_bin(&socket, cluster, topic, &key, &value, opts).map_err(ipc_err_to_php)
+    ipc::produce_fnf_bin(
+        &socket,
+        cluster,
+        topic,
+        key.as_deref().copied(),
+        value.as_deref().copied(),
+        opts,
+    )
+    .map_err(ipc_err_to_php)
 }
 
 /// 同步带 ack 全局函数 API。参数同 [`hi_kafka_produce_fnf`] + `timeout_ms`。
 #[php_function]
+#[php(optional = headers)]
 pub fn hi_kafka_produce_sync(
     cluster: &str,
     topic: &str,
-    key: BinarySlice<u8>,
-    value: BinarySlice<u8>,
+    key: Option<BinarySlice<u8>>,
+    value: Option<BinarySlice<u8>>,
     headers: Option<&ZendHashTable>,
     partition: Option<i64>,
     timestamp_ms: Option<i64>,
@@ -255,8 +275,16 @@ pub fn hi_kafka_produce_sync(
         timeout_ms.unwrap_or(5000),
     )? as u64);
     let opts = build_options(headers, partition, timestamp_ms)?;
-    let resp = ipc::produce_sync_bin(&socket, cluster, topic, &key, &value, opts, timeout)
-        .map_err(ipc_err_to_php)?;
+    let resp = ipc::produce_sync_bin(
+        &socket,
+        cluster,
+        topic,
+        key.as_deref().copied(),
+        value.as_deref().copied(),
+        opts,
+        timeout,
+    )
+    .map_err(ipc_err_to_php)?;
     client::resp_to_zval(resp)
 }
 
@@ -505,29 +533,38 @@ pub fn hi_kafka_verify_hello_resp(bytes: BinarySlice<u8>) -> PhpResult<()> {
 }
 
 /// 编一帧 PRODUCE_FNF（fire-and-forget），返回完整帧字节串（PHP binary string）。
+/// `$key` / `$value` 为 `null` 时编码为 null（tombstone）。
 #[php_function]
+#[php(optional = headers)]
 pub fn hi_kafka_encode_fnf_frame(
     cluster: &str,
     topic: &str,
-    key: BinarySlice<u8>,
-    value: BinarySlice<u8>,
+    key: Option<BinarySlice<u8>>,
+    value: Option<BinarySlice<u8>>,
     headers: Option<&ZendHashTable>,
     partition: Option<i64>,
     timestamp_ms: Option<i64>,
 ) -> PhpResult<ZendBinary> {
     let opts = build_options(headers, partition, timestamp_ms)?;
-    let input = produce_input(cluster, topic, &key, &value, &opts);
+    let input = produce_input(
+        cluster,
+        topic,
+        key.as_deref().copied(),
+        value.as_deref().copied(),
+        &opts,
+    );
     protocol::with_produce_frame(&input, 0, None, ZendBinary::copy_from)
         .map_err(|e| PhpException::default(e.to_string()))
 }
 
 /// 编一帧 PRODUCE_REQ，返回 `['cid' => int, 'frame' => binary]`。
 #[php_function]
+#[php(optional = headers)]
 pub fn hi_kafka_encode_req_frame(
     cluster: &str,
     topic: &str,
-    key: BinarySlice<u8>,
-    value: BinarySlice<u8>,
+    key: Option<BinarySlice<u8>>,
+    value: Option<BinarySlice<u8>>,
     headers: Option<&ZendHashTable>,
     partition: Option<i64>,
     timestamp_ms: Option<i64>,
@@ -535,7 +572,13 @@ pub fn hi_kafka_encode_req_frame(
 ) -> PhpResult<Zval> {
     let opts = build_options(headers, partition, timestamp_ms)?;
     let timeout_ms = require_positive_u32("timeout_ms", timeout_ms.unwrap_or(5000))?;
-    let input = produce_input(cluster, topic, &key, &value, &opts);
+    let input = produce_input(
+        cluster,
+        topic,
+        key.as_deref().copied(),
+        value.as_deref().copied(),
+        &opts,
+    );
     let cid = protocol::next_cid();
     let frame = protocol::with_produce_frame(&input, cid, Some(timeout_ms), ZendBinary::copy_from)
         .map_err(|e| PhpException::default(e.to_string()))?;
@@ -549,8 +592,8 @@ pub fn hi_kafka_encode_req_frame(
 fn produce_input<'a>(
     cluster: &'a str,
     topic: &'a str,
-    key: &'a [u8],
-    value: &'a [u8],
+    key: Option<&'a [u8]>,
+    value: Option<&'a [u8]>,
     opts: &'a ipc::ProduceOptions,
 ) -> protocol::ProduceInput<'a> {
     protocol::ProduceInput {
@@ -1041,6 +1084,7 @@ pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
     module
         .function(wrap_function!(hi_kafka_version))
         .function(wrap_function!(hi_kafka_ensure_worker))
+        .function(wrap_function!(hi_kafka_check_socket_owner))
         .function(wrap_function!(hi_kafka_register_cluster))
         .function(wrap_function!(hi_kafka_remember_cluster))
         .function(wrap_function!(hi_kafka_remember_oauth_token))

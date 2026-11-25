@@ -70,8 +70,8 @@ async fn test_produce_fnf_end_to_end() {
     let msg = ProduceFnf {
         cluster: "default".into(),
         topic: "e2e-topic".into(),
-        key: bytes::Bytes::from_static(b"key-1"),
-        value: bytes::Bytes::from_static(b"hello e2e"),
+        key: Some(bytes::Bytes::from_static(b"key-1")),
+        value: Some(bytes::Bytes::from_static(b"hello e2e")),
         ..Default::default()
     };
     let mut payload = BytesMut::new();
@@ -111,8 +111,8 @@ async fn test_multiple_frames_on_same_connection() {
         let msg = ProduceFnf {
             cluster: "default".into(),
             topic: "burst".into(),
-            key: bytes::Bytes::from(format!("k-{i}")),
-            value: bytes::Bytes::from(format!("v-{i}")),
+            key: Some(bytes::Bytes::from(format!("k-{i}"))),
+            value: Some(bytes::Bytes::from(format!("v-{i}"))),
             ..Default::default()
         };
         let mut payload = BytesMut::new();

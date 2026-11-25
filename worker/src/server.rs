@@ -208,13 +208,23 @@ impl Server {
                     return Ok(());
                 }
                 res = self.listener.accept() => {
-                    last_active = tokio::time::Instant::now();
                     match res {
                         Ok((stream, _addr)) => {
+                            let cred = match stream.peer_cred() {
+                                Ok(cred) if crate::peer::accepts_client(cred.uid()) => cred,
+                                Ok(cred) => {
+                                    warn!(uid = cred.uid(), pid = ?cred.pid(), "rejected client of another user");
+                                    continue;
+                                }
+                                Err(e) => {
+                                    warn!(error = ?e, "rejected client: peer credentials unavailable");
+                                    continue;
+                                }
+                            };
+                            last_active = tokio::time::Instant::now();
                             debug!("client connected");
                             clients.expedited.store(false, Ordering::Release);
-                            let connection =
-                                clients.register(stream.peer_cred().ok().and_then(|c| c.pid()));
+                            let connection = clients.register(cred.pid());
                             Metrics::inc(&self.metrics.ipc_connections_total);
                             let producer = self.producer.clone();
                             let consumer = self.consumer.clone();

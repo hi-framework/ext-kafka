@@ -72,7 +72,8 @@ for suite in "$@"; do
             # 不能传空的 RUSTFLAGS：会覆盖 Alpine builder 镜像中必需的 -crt-static 设置。
             rust_env=()
             [[ -n "$TEST_RUSTFLAGS" ]] && rust_env=(-e "RUSTFLAGS=$TEST_RUSTFLAGS")
-            "$CLI" run --rm --platform "$PLATFORM" --network host "${rust_env[@]}" \
+            # ${a[@]+...}：bash 3.2（macOS 宿主）在 set -u 下展开空数组会报 unbound variable。
+            "$CLI" run --rm --platform "$PLATFORM" --network host ${rust_env[@]+"${rust_env[@]}"} \
                 -v "$PWD:/work:ro" "$BUILDER" sh -c '
                 rm -rf /tmp/w && mkdir /tmp/w && cd /work && tar --exclude=./target --exclude=./php-driver/vendor -cf - . | tar -xf - -C /tmp/w
                 cd /tmp/w && CARGO_TARGET_DIR=/src/target with-libclang cargo test --workspace --features hi-kafka-worker/kafka-vendored-tls > /tmp/cargo-test.log 2>&1
@@ -87,7 +88,7 @@ for suite in "$@"; do
         e2e)
             run_in "$IMAGE" env EXT_PATH=$EXT PHP_EXTRA_ARGS="$PHP_BASE" ./scripts/run-all-e2e.sh
             run_in "$IMAGE" env EXT_PATH=$EXT PHP_EXTRA_ARGS="$PHP_BASE -d extension=swoole" \
-                E2E_TESTS="consumer-record-memory-swoole-v2 coroutine-consumer-stream-v2 client-recovery-v2 binary-roundtrip-v2 worker-exec-v2" \
+                E2E_TESTS="consumer-record-memory-swoole-v2 coroutine-consumer-stream-v2 client-recovery-v2 binary-roundtrip-v2 producer-null-v2 worker-exec-v2" \
                 ./scripts/run-all-e2e.sh
             # 以容器 1 号进程运行（不经 shell）：覆盖「1 号进程就是业务 PHP」时的僵尸回收
             zombie_out=$(run_in "$IMAGE" php -n $PHP_BASE -d extension=$EXT \

@@ -73,33 +73,43 @@ impl Client {
         Ok(())
     }
 
-    /// Fire-and-forget 生产。`$key` / `$value` 是任意字节（binary-safe，不要求 UTF-8）；
+    /// Fire-and-forget 生产。`$key` / `$value` 是任意字节（binary-safe，不要求 UTF-8），
+    /// 必须显式传入；`null` key 由 partitioner 分配分区，`null` value 即 tombstone
+    /// （compacted topic 的删除标记）。
     /// `$headers` 关联数组（`[]` = 无 headers，值同样是任意字节）；
     /// `$partition` 与 `$timestampMs` 可选，`null` / 缺省 = auto。
-    #[php(defaults(headers = None, partition = None, timestampMs = None))]
+    #[php(optional = headers, defaults(headers = None, partition = None, timestampMs = None))]
     pub fn produce_fnf(
         &self,
         cluster: &str,
         topic: &str,
-        key: ext_php_rs::binary_slice::BinarySlice<u8>,
-        value: ext_php_rs::binary_slice::BinarySlice<u8>,
+        key: Option<ext_php_rs::binary_slice::BinarySlice<u8>>,
+        value: Option<ext_php_rs::binary_slice::BinarySlice<u8>>,
         headers: Option<&ext_php_rs::types::ZendHashTable>,
         partition: Option<i64>,
         timestampMs: Option<i64>,
     ) -> PhpResult<()> {
         let opts = super::build_options(headers, partition, timestampMs)?;
-        ipc::produce_fnf_bin(&self.socket, cluster, topic, &key, &value, opts)
-            .map_err(super::ipc_err_to_php)
+        ipc::produce_fnf_bin(
+            &self.socket,
+            cluster,
+            topic,
+            key.as_deref().copied(),
+            value.as_deref().copied(),
+            opts,
+        )
+        .map_err(super::ipc_err_to_php)
     }
 
-    /// 同步生产，等 broker ack。返回 `['ok' => bool, ...]` 数组。
-    #[php(defaults(headers = None, partition = None, timestampMs = None, timeoutMs = None))]
+    /// 同步生产，等 broker ack。返回 `['ok' => bool, ...]` 数组。`$key` / `$value`
+    /// 同 `produceFnf`，可为 `null`。
+    #[php(optional = headers, defaults(headers = None, partition = None, timestampMs = None, timeoutMs = None))]
     pub fn produce_sync(
         &self,
         cluster: &str,
         topic: &str,
-        key: ext_php_rs::binary_slice::BinarySlice<u8>,
-        value: ext_php_rs::binary_slice::BinarySlice<u8>,
+        key: Option<ext_php_rs::binary_slice::BinarySlice<u8>>,
+        value: Option<ext_php_rs::binary_slice::BinarySlice<u8>>,
         headers: Option<&ext_php_rs::types::ZendHashTable>,
         partition: Option<i64>,
         timestampMs: Option<i64>,
@@ -110,8 +120,16 @@ impl Client {
             timeoutMs.unwrap_or(5000),
         )? as u64);
         let opts = super::build_options(headers, partition, timestampMs)?;
-        let resp = ipc::produce_sync_bin(&self.socket, cluster, topic, &key, &value, opts, timeout)
-            .map_err(super::ipc_err_to_php)?;
+        let resp = ipc::produce_sync_bin(
+            &self.socket,
+            cluster,
+            topic,
+            key.as_deref().copied(),
+            value.as_deref().copied(),
+            opts,
+            timeout,
+        )
+        .map_err(super::ipc_err_to_php)?;
         resp_to_zval(resp)
     }
 
@@ -145,8 +163,15 @@ impl Client {
                 .unwrap_or(-1),
             timestamp_ms: timestampMs.unwrap_or(-1),
         };
-        ipc::produce_fnf_bin(&self.socket, cluster, topic, &key_vec, &value_vec, opts)
-            .map_err(super::ipc_err_to_php)
+        ipc::produce_fnf_bin(
+            &self.socket,
+            cluster,
+            topic,
+            Some(&key_vec),
+            Some(&value_vec),
+            opts,
+        )
+        .map_err(super::ipc_err_to_php)
     }
 
     /// Binary-safe 同步生产。参数同 `produceFnfBin` + `$timeoutMs`。
@@ -183,8 +208,8 @@ impl Client {
             &self.socket,
             cluster,
             topic,
-            &key_vec,
-            &value_vec,
+            Some(&key_vec),
+            Some(&value_vec),
             opts,
             timeout,
         )

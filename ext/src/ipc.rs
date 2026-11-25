@@ -283,8 +283,8 @@ pub struct ProduceOptions {
 fn produce_input<'a>(
     cluster: &'a str,
     topic: &'a str,
-    key: &'a [u8],
-    value: &'a [u8],
+    key: Option<&'a [u8]>,
+    value: Option<&'a [u8]>,
     opts: &'a ProduceOptions,
 ) -> protocol::ProduceInput<'a> {
     protocol::ProduceInput {
@@ -298,13 +298,13 @@ fn produce_input<'a>(
     }
 }
 
-/// 生产一条消息；key / value 为任意字节（PHP 字符串是字节串，不要求 UTF-8）。
+/// 生产一条消息；key / value 为任意字节（PHP 字符串是字节串，不要求 UTF-8），`None` 为 null。
 pub fn produce_fnf_bin(
     socket: &str,
     cluster: &str,
     topic: &str,
-    key: &[u8],
-    value: &[u8],
+    key: Option<&[u8]>,
+    value: Option<&[u8]>,
     opts: ProduceOptions,
 ) -> Result<(), IpcError> {
     with_retry(socket, || {
@@ -316,8 +316,8 @@ fn produce_fnf_bin_inner(
     socket: &str,
     cluster: &str,
     topic: &str,
-    key: &[u8],
-    value: &[u8],
+    key: Option<&[u8]>,
+    value: Option<&[u8]>,
     opts: &ProduceOptions,
 ) -> Result<(), IpcError> {
     ensure(socket)?;
@@ -339,8 +339,8 @@ pub fn produce_sync_bin(
     socket: &str,
     cluster: &str,
     topic: &str,
-    key: &[u8],
-    value: &[u8],
+    key: Option<&[u8]>,
+    value: Option<&[u8]>,
     opts: ProduceOptions,
     timeout: Duration,
 ) -> Result<ProduceResp, IpcError> {
@@ -353,8 +353,8 @@ fn produce_sync_bin_inner(
     socket: &str,
     cluster: &str,
     topic: &str,
-    key: &[u8],
-    value: &[u8],
+    key: Option<&[u8]>,
+    value: Option<&[u8]>,
     opts: &ProduceOptions,
     timeout: Duration,
 ) -> Result<ProduceResp, IpcError> {
@@ -773,7 +773,13 @@ mod tests {
             partition: 3,
             timestamp_ms: 12345,
         };
-        let input = produce_input("cluster", "topic", b"k\x00ey", b"v\x00al\xff", &opts);
+        let input = produce_input(
+            "cluster",
+            "topic",
+            Some(b"k\x00ey"),
+            Some(b"v\x00al\xff"),
+            &opts,
+        );
         let decoded = protocol::with_produce_frame(&input, 7, None, |frame| {
             let (header, payload) = decode_frame(frame);
             assert_eq!(header.kind, FrameType::ProduceFnf);
@@ -783,8 +789,8 @@ mod tests {
         .unwrap();
         assert_eq!(decoded.cluster, "cluster");
         assert_eq!(decoded.topic, "topic");
-        assert_eq!(decoded.key.as_ref(), b"k\x00ey");
-        assert_eq!(decoded.value.as_ref(), b"v\x00al\xff");
+        assert_eq!(decoded.key.as_deref(), Some(&b"k\x00ey"[..]));
+        assert_eq!(decoded.value.as_deref(), Some(&b"v\x00al\xff"[..]));
         assert_eq!(decoded.partition, 3);
         assert_eq!(decoded.timestamp_ms, 12345);
         assert_eq!(decoded.headers, opts.headers);
@@ -799,9 +805,9 @@ mod tests {
         };
         // 先编一条大消息再编小消息：复用缓冲必须被清空，不能残留上一帧的字节。
         let large = vec![1u8; 4096];
-        let big = produce_input("c", "t", b"k", &large, &opts);
+        let big = produce_input("c", "t", Some(b"k"), Some(&large), &opts);
         protocol::with_produce_frame(&big, 1, None, |frame| frame.len()).unwrap();
-        let small = produce_input("c", "t", b"k", b"v", &opts);
+        let small = produce_input("c", "t", Some(b"k"), Some(b"v"), &opts);
         let decoded = protocol::with_produce_frame(&small, 2, Some(1500), |frame| {
             let (header, payload) = decode_frame(frame);
             assert_eq!(header.kind, FrameType::ProduceReq);
@@ -809,6 +815,6 @@ mod tests {
         })
         .unwrap();
         assert_eq!(decoded.timeout_ms, 1500);
-        assert_eq!(decoded.msg.value.as_ref(), b"v");
+        assert_eq!(decoded.msg.value.as_deref(), Some(&b"v"[..]));
     }
 }

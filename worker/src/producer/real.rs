@@ -271,11 +271,14 @@ impl Producer for KafkaProducer {
     async fn produce_fnf(&self, msg: ProduceFnf) -> anyhow::Result<()> {
         let entry = self.entry_for(&msg.cluster).await?;
         let producer = entry.producer.clone();
-        let value_slice: &[u8] = msg.value.as_ref();
-        let key_slice: &[u8] = msg.key.as_ref();
-        let mut record = FutureRecord::to(&msg.topic)
-            .payload(value_slice)
-            .key(key_slice);
+        // null key / null value（tombstone）不设置对应字段，librdkafka 按 null 发送。
+        let mut record = FutureRecord::<[u8], [u8]>::to(&msg.topic);
+        if let Some(value) = msg.value.as_deref() {
+            record = record.payload(value);
+        }
+        if let Some(key) = msg.key.as_deref() {
+            record = record.key(key);
+        }
 
         if msg.partition >= 0 {
             record = record.partition(msg.partition);
@@ -345,17 +348,20 @@ impl Producer for KafkaProducer {
     async fn produce_ack(&self, msg: ProduceFnf, timeout: Duration) -> anyhow::Result<ProduceResp> {
         let entry = self.entry_for(&msg.cluster).await?;
         let producer = entry.producer.clone();
-        let value_slice: &[u8] = msg.value.as_ref();
-        let key_slice: &[u8] = msg.key.as_ref();
         debug!(
             cluster = %msg.cluster,
             topic = %msg.topic,
             headers_count = msg.headers.len(),
             "PRODUCE_REQ inbound"
         );
-        let mut record = FutureRecord::to(&msg.topic)
-            .payload(value_slice)
-            .key(key_slice);
+        // null key / null value（tombstone）不设置对应字段，librdkafka 按 null 发送。
+        let mut record = FutureRecord::<[u8], [u8]>::to(&msg.topic);
+        if let Some(value) = msg.value.as_deref() {
+            record = record.payload(value);
+        }
+        if let Some(key) = msg.key.as_deref() {
+            record = record.key(key);
+        }
 
         if msg.partition >= 0 {
             record = record.partition(msg.partition);
@@ -656,8 +662,8 @@ mod tests {
         let msg = ProduceFnf {
             cluster: "c".into(),
             topic: "t".into(),
-            key: bytes::Bytes::from_static(b"k"),
-            value: bytes::Bytes::from_static(b"v"),
+            key: Some(bytes::Bytes::from_static(b"k")),
+            value: Some(bytes::Bytes::from_static(b"v")),
             partition: -1,
             timestamp_ms: -1,
             headers: vec![],
@@ -677,8 +683,8 @@ mod tests {
             msg: ProduceFnf {
                 cluster: "c".into(),
                 topic: "t".into(),
-                key: bytes::Bytes::from_static(b"k"),
-                value: bytes::Bytes::from_static(b"v"),
+                key: Some(bytes::Bytes::from_static(b"k")),
+                value: Some(bytes::Bytes::from_static(b"v")),
                 partition: 3,
                 timestamp_ms: 12345,
                 headers: vec![],

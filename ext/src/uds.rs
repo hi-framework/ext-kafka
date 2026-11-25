@@ -4,9 +4,12 @@
 //! accept，监听队列满后 `connect()` 会无限期阻塞，PHP 进程（包括就绪探测）随之挂死。
 //! 这里用非阻塞 connect：队列满时 Linux 返回 `EAGAIN`，在截止时间内重试；返回
 //! `EINPROGRESS` 时 poll 可写后检查 `SO_ERROR`。
+//!
+//! 连上之后校验对端 worker 的 uid：其它用户抢先占用 socket 路径时拒绝连接。
 
+use hi_kafka_worker::peer;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -40,14 +43,14 @@ pub fn connect(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
         };
         if rc == 0 {
             stream.set_nonblocking(false)?;
-            return Ok(stream);
+            return verify_worker(stream, path);
         }
         let error = io::Error::last_os_error();
         match error.raw_os_error() {
             Some(libc::EINPROGRESS) => {
                 wait_writable(&stream, deadline)?;
                 stream.set_nonblocking(false)?;
-                return Ok(stream);
+                return verify_worker(stream, path);
             }
             // 监听队列已满：worker 没有在 accept。截止时间内用新 socket 重试。
             Some(libc::EAGAIN) => {
@@ -59,6 +62,15 @@ pub fn connect(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
             _ => return Err(error),
         }
     }
+}
+
+/// 只把连接交给与本进程同用户（或 root）的 worker，见 [`hi_kafka_worker::peer`]。
+fn verify_worker(stream: UnixStream, path: &Path) -> io::Result<UnixStream> {
+    let uid = peer::peer_uid(stream.as_fd())?;
+    if !peer::trusts_worker(uid) {
+        return Err(peer::untrusted(path, uid));
+    }
+    Ok(stream)
 }
 
 fn wait_writable(stream: &UnixStream, deadline: Instant) -> io::Result<()> {

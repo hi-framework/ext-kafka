@@ -141,7 +141,7 @@ Producer 默认值（集群配置中显式设置时以业务为准）：
 | `queue.buffering.max.kbytes` | 131072（128 MiB） | 共享 Producer 本地队列上限。librdkafka 自身默认 1 GiB 是按每进程一个客户端设计的；一个 worker 服务整个节点时会在 broker 变慢时涨到 GiB 级 |
 | `compression.codec` | `lz4` | 未设置 `compression.codec` / `compression.type` 时生效 |
 
-本地队列满时 `produceFnf` 最多等待 1 秒、`produceSync` 在其 `timeoutMs` 内等待空间，仍满则抛出可重试的 `PRODUCER_QUEUE_FULL`。key、value 与 header 值均为任意字节（不要求 UTF-8）。
+本地队列满时 `produceFnf` 最多等待 1 秒、`produceSync` 在其 `timeoutMs` 内等待空间，仍满则抛出可重试的 `PRODUCER_QUEUE_FULL`。key、value 与 header 值均为任意字节（不要求 UTF-8）。key 和 value 可以传 `null`：null key 由 partitioner 分配分区，null value 即 tombstone（compacted topic 的删除标记），与空串是不同的值。
 
 真实 backend 在 borrowed Kafka record 被复制前申请精确全局 permit；detach/encode 瞬时双份内容按两倍 wire size 计费，编码后只保留一份。librdkafka 本地队列也按协商 byte 上限配置。RSS 验收方法和 allocator tolerance 见架构文档的 release gates。
 

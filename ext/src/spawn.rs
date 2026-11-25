@@ -49,6 +49,10 @@ pub enum SpawnError {
     #[error("create spawn lock file: {0}")]
     CreateLockFile(std::io::Error),
 
+    /// socket 路径被其它用户占用（见 [`hi_kafka_worker::peer`]）。
+    #[error("{0}")]
+    UntrustedSocket(std::io::Error),
+
     /// 无法 exec（`reason`）而进程已有 {count} 个线程：不 exec 的子进程可能继承其它
     /// 线程持有的锁而死锁。仅在 `HI_KAFKA_STRICT_FORK=1` 时拒绝。
     #[error(
@@ -143,6 +147,9 @@ pub fn ensure_worker(cfg: &SpawnConfig) -> Result<SpawnOutcome, SpawnError> {
     if worker_alive(&cfg.socket) {
         return Ok(SpawnOutcome::AlreadyAlive);
     }
+    // 其它用户的 socket 握手必然失败，也无法被本进程拉起的 worker 替换：直接报出原因，
+    // 而不是等到就绪超时。
+    hi_kafka_worker::peer::check_socket_owner(&cfg.socket).map_err(SpawnError::UntrustedSocket)?;
 
     // 准备 lock 文件路径
     let lock_path = lock_path_for(&cfg.socket);

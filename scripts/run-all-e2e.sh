@@ -33,6 +33,7 @@ ALL_TESTS=(
     consumer-stream-v2
     producer-generation-v2
     binary-roundtrip-v2
+    producer-null-v2
     consumer-record-memory-v2
     consumer-record-memory-swoole-v2
     coroutine-consumer-stream-v2
@@ -43,6 +44,7 @@ ALL_TESTS=(
     worker-spawn-v2
     worker-exec-v2
     worker-goodbye-flush-v2
+    worker-peer-uid-v2
     client-fork-v2
     worker-drain-v2
     panic-recovery

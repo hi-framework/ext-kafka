@@ -914,7 +914,15 @@ worker 只有在以下条件同时满足时才可 idle self-terminate：
 
 - socket 应位于权限受控目录，而不是可被不可信用户替换的公共路径；
 - socket 和 lock 文件权限遵循最小权限；
-- Linux 上 SHOULD 校验 SO_PEERCRED，至少记录 client PID/UID；
+- 默认 socket 在公共的 `/tmp`，因此两端都校验对端 uid（`worker/src/peer.rs`），不依赖
+  socket 文件权限位（worker 继承拉起者的 umask）：
+  - worker 只接受与自己同 uid 或 root 的客户端（`SO_PEERCRED` / `getpeereid`），拒绝的
+    连接记 warning、不刷新 idle 计时；
+  - 客户端只连接同 uid 或 root 的 worker，root 客户端信任任何 worker（兼容在容器里以
+    root 执行命令、连接 FPM 用户拉起的 worker）。Rust 侧在 connect 后校验对端 uid；协程
+    driver 取不到对端凭据，连接前检查 socket 文件属主（`hi_kafka_check_socket_owner`）；
+  - 路径被其它用户占用时 ensure 立即报错，不等就绪超时。`.spawn-lock` / `.pid` 被抢先创建
+    仍会导致拉起失败（拒绝服务），多用户共用机器时应把 socket 放到私有目录；
 - 不记录 broker password、OAuth token、SASL secret 或消息正文；
 - 所有数量、长度、timeout、partition、offset 输入必须 checked conversion；
 - per-frame limit 在 allocation 前验证；
