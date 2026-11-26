@@ -37,8 +37,10 @@ ALL_TESTS=(
     consumer-record-memory-v2
     consumer-record-memory-swoole-v2
     coroutine-consumer-stream-v2
+    coroutine-consumer-window-v2
     client-recovery-v2
     consumer-offset-v2
+    consumer-poll-interval-v2
     consumer-rebalance-v2
     consumer-cooperative-v2
     worker-spawn-v2

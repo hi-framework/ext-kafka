@@ -35,6 +35,10 @@ const MAX_CONSUMER_WIRE_BYTES: u64 = (MAX_PAYLOAD_LEN + HEADER_LEN) as u64;
 const DEFAULT_SUB_BYTES: u64 = MAX_CONSUMER_WIRE_BYTES;
 const DEFAULT_RESUME_GRACE: Duration = Duration::from_secs(10);
 const BACKPRESSURE_PAUSE_DEBOUNCE: Duration = Duration::from_millis(5);
+/// backpressure 暂停期间 actor 只等待 PHP，不再从 librdkafka 取消息。librdkafka 要求
+/// 应用至少每 `max.poll.interval.ms`（默认 5 分钟）拉取一次，否则主动离开 group。
+/// 暂停期间按此间隔做一次不取消息的 keepalive 拉取，让 PHP 处理耗时不受该上限约束。
+const KEEPALIVE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
 pub struct SourceRecord {
@@ -92,6 +96,11 @@ pub(crate) trait ConsumerSource: Send {
     async fn pause(&mut self, partitions: &[(String, i32)]) -> Result<(), ConsumerError>;
     /// 空列表表示 librdkafka 当前的完整 assignment。
     async fn resume(&mut self, partitions: &[(String, i32)]) -> Result<(), ConsumerError>;
+    /// 分区全部暂停期间由 actor 定期调用：不交付消息，只让 librdkafka 重置
+    /// `max.poll.interval.ms` 计时并执行挂起的 rebalance 回调。
+    async fn keepalive(&mut self) -> Result<(), ConsumerError> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -528,6 +537,7 @@ impl ConsumerManager {
             user_paused: BTreeSet::new(),
             backpressure_paused: false,
             backpressure_started: None,
+            keepalive_at: tokio::time::Instant::now() + KEEPALIVE_POLL_INTERVAL,
             attachment_lease: 1,
             budget: self.budget.clone(),
             grace: self.resume_grace,
@@ -626,6 +636,8 @@ struct SubscriptionActor {
     user_paused: BTreeSet<PartitionKey>,
     backpressure_paused: bool,
     backpressure_started: Option<tokio::time::Instant>,
+    /// 下一次 keepalive 拉取的时间点；只在 backpressure 暂停期间生效。
+    keepalive_at: tokio::time::Instant,
     attachment_lease: u64,
     budget: GlobalBudget,
     grace: Duration,
@@ -659,6 +671,9 @@ impl SubscriptionActor {
                 tokio::select! {
                     command = self.commands.recv() => if !self.handle_command(command).await { return; },
                     _ = tokio::time::sleep_until(deadline) => return,
+                    _ = tokio::time::sleep_until(self.keepalive_at), if self.backpressure_paused => {
+                        if !self.keepalive().await { return; }
+                    }
                     _ = self.shutdown.wait_draining() => return,
                 }
                 continue;
@@ -694,6 +709,9 @@ impl SubscriptionActor {
                         }
                         self.blocked_global_bytes = None;
                     }
+                    _ = tokio::time::sleep_until(self.keepalive_at), if self.backpressure_paused => {
+                        if !self.keepalive().await { return; }
+                    }
                     _ = self.shutdown.wait_draining() => { let _ = self.push_close().await; return; }
                 }
                 continue;
@@ -715,6 +733,7 @@ impl SubscriptionActor {
                 }
                 continue;
             }
+            self.keepalive_at = tokio::time::Instant::now() + KEEPALIVE_POLL_INTERVAL;
             tokio::select! {
                 command = self.commands.recv() => if !self.handle_command(command).await { return; },
                 record = self.source.next_record(&self.budget) => {
@@ -1214,8 +1233,29 @@ impl SubscriptionActor {
                 }
             }
         }
-        let command = self.commands.recv().await;
-        self.handle_command(command).await
+        tokio::select! {
+            command = self.commands.recv() => self.handle_command(command).await,
+            _ = tokio::time::sleep_until(self.keepalive_at), if self.backpressure_paused => {
+                self.keepalive().await
+            }
+        }
+    }
+
+    /// 暂停期间的 keepalive 拉取。返回 false 表示 source 已不可用，actor 应退出；
+    /// 期间产生的 rebalance notice 由主循环开头的 `take_notice` 处理。
+    async fn keepalive(&mut self) -> bool {
+        self.keepalive_at = tokio::time::Instant::now() + KEEPALIVE_POLL_INTERVAL;
+        if let Err(error) = self.source.keepalive().await {
+            Metrics::inc(&self.metrics.consumer_stream_errors_total);
+            warn!(
+                subscription_id = self.id,
+                ?error,
+                "consumer source stopped during keepalive"
+            );
+            let _ = self.push_response(error.response()).await;
+            return false;
+        }
+        true
     }
 
     async fn user_pause(&mut self, partitions: Vec<(String, i32)>) -> Result<(), ConsumerError> {
@@ -1422,6 +1462,7 @@ mod actor_tests {
     struct Calls {
         paused: Vec<Vec<(String, i32)>>,
         resumed: Vec<Vec<(String, i32)>>,
+        keepalives: usize,
     }
 
     /// 由测试通过 channel 逐条喂入 record / rebalance notice 的 source，记录所有
@@ -1466,6 +1507,10 @@ mod actor_tests {
         }
         async fn resume(&mut self, partitions: &[(String, i32)]) -> Result<(), ConsumerError> {
             self.calls.lock().unwrap().resumed.push(partitions.to_vec());
+            Ok(())
+        }
+        async fn keepalive(&mut self) -> Result<(), ConsumerError> {
+            self.calls.lock().unwrap().keepalives += 1;
             Ok(())
         }
     }
@@ -1647,6 +1692,40 @@ mod actor_tests {
         wait_until(&h.calls, |c| !c.resumed.is_empty()).await;
 
         assert_eq!(h.calls.lock().unwrap().resumed.last(), Some(&tp(&[0])));
+    }
+
+    /// PHP 长时间不 ACK 时 actor 只等待命令。暂停期间必须持续 keepalive 拉取，
+    /// 否则超过 max.poll.interval.ms 后 librdkafka 会主动离开 group。
+    #[tokio::test]
+    async fn keepalive_polls_source_while_backpressure_paused() {
+        let mut h = open().await;
+        h.script
+            .send(Script::Notices(vec![SourceNotice::Assign(tp(&[0]))]))
+            .unwrap();
+        next_frame(&mut h, FrameType::RebalanceAssign).await;
+        h.script.send(Script::Record(record(0, 7))).unwrap();
+        let frame = next_frame(&mut h, FrameType::ConsumeMessage).await;
+        let message = ConsumeMessage::decode(&frame.payload).unwrap();
+        wait_until(&h.calls, |c| c.paused.contains(&vec![])).await;
+        assert_eq!(h.calls.lock().unwrap().keepalives, 0);
+
+        let deadline = tokio::time::Instant::now() + KEEPALIVE_POLL_INTERVAL * 4;
+        while h.calls.lock().unwrap().keepalives < 2 {
+            assert!(tokio::time::Instant::now() < deadline, "keepalive deadline");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        h.session
+            .ack(ConsumeAck {
+                subscription_id: h.ready.subscription_id,
+                subscription_epoch: message.subscription_epoch,
+                delivery_id: message.delivery_id,
+                message_credit: 1,
+                byte_credit: message.wire_size,
+            })
+            .await
+            .unwrap();
+        wait_until(&h.calls, |c| !c.resumed.is_empty()).await;
     }
 
     /// 没有用户暂停时按 librdkafka 的真实 assignment（空列表）恢复，与 pause 对称，

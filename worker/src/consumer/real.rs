@@ -8,6 +8,7 @@ use crate::error::WorkerError;
 use crate::watermark::PartitionKey;
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::FutureExt;
 use hi_kafka_proto::{
     ConsumeOpen, ErrorKind, MessageHeader, OperationOutcome, MAX_MESSAGE_HEADERS,
 };
@@ -470,6 +471,30 @@ impl ConsumerSource for KafkaSource {
         self.consumer
             .resume(&tpl)
             .map_err(|e| ConsumerError::Backend(anyhow::anyhow!(e)))
+    }
+
+    async fn keepalive(&mut self) -> Result<(), ConsumerError> {
+        // recv() 的第一次 poll 以零超时拉取 consumer 队列：librdkafka 据此重置
+        // max.poll.interval.ms 计时，并执行挂起的 rebalance 回调（notice 经 notice_signal
+        // 交给 actor）。分区都已暂停，正常拉不到消息；若有漏网消息，seek 回它的 offset，
+        // 暂停结束后重新拉取，不丢也不提前交付。
+        let slipped = match self.consumer.recv().now_or_never() {
+            None => return Ok(()),
+            Some(Ok(message)) => (
+                PartitionKey::new(message.topic(), message.partition()),
+                message.offset(),
+            ),
+            Some(Err(error)) if is_recoverable_consumer_error(&error) => {
+                warn!(error = %error, "transient Kafka consumer error during keepalive");
+                return Ok(());
+            }
+            Some(Err(error)) => {
+                return Err(ConsumerError::Backend(anyhow::Error::new(
+                    kafka_consumer_error_to_worker(&error),
+                )));
+            }
+        };
+        self.seek(&[slipped]).await
     }
 }
 

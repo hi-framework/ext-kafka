@@ -726,6 +726,8 @@ worker 还必须有跨 subscription 的 global in-flight byte semaphore。
 
 用户显式 pause 和自动 credit/global-budget pause 是两个独立原因，actor 必须分别持有 pause reason。自动 resume 只恢复未被用户显式暂停的 assignment，不得覆盖用户 pause。断线 grace 期间同样进入自动 pause，避免 librdkafka 队列继续累积。
 
+自动 pause 期间 actor 不取消息，但 MUST 按固定间隔（当前 1 秒）对 librdkafka consumer 队列做一次零超时 keepalive 拉取：librdkafka 要求应用每 `max.poll.interval.ms` 内至少拉取一次，否则主动离开 group；rebalance 回调也只在拉取时执行。顺序式 driver 的窗口为 1，PHP 处理任意一条消息期间 subscription 都处于自动 pause（并发窗口占满时同理），因此 PHP 处理耗时不得受 `max.poll.interval.ms` 约束，该参数只用于发现 worker 自身停止拉取。keepalive 若意外拉到消息（分区未暂停），必须 seek 回其 offset，不得交付或丢弃。
+
 credit 瞬时归零时 actor 必须立即停止调用 `recv()`，但可以对昂贵的 librdkafka assignment pause 做数毫秒有界去抖；ACK 在去抖窗口内恢复 credit 时不得执行每消息一次的 pause/resume。持续背压、全局预算耗尽和断线仍必须进入真实 pause。去抖期间只能增长既有有界 librdkafka queue，不能引入新的应用层队列。
 
 FlowControl 可以与 ACK 合并传输以减少 frame，但内部语义和指标必须独立。官方顺序式 driver MUST 使用该原子能力：`ack()` 只在本地完成 delivery identity settlement；下一次 `next()` 将 pending ACK 与该 delivery 的精确 message/byte credit 合并为一个 ConsumeAck frame。`commit()`、pause、显式 resume 与 close 在发送自身控制帧前 MUST 先以 zero-credit ACK flush pending settlement，因此下一条 ConsumeMessage 仍不可能越过这些 control barrier；zero-credit flush 后，与该 delivery 等额的 replenishment intent 必须留在 driver 本地，若流仍继续，下一次显式 `next()` 再通过 FlowControl 开窗，不能因 control barrier 丢失 credit。NACK 保持立即、终止式发送。
@@ -733,6 +735,8 @@ FlowControl 可以与 ACK 合并传输以减少 frame，但内部语义和指标
 deferred wire ACK 不改变 at-least-once：PHP 在 `ack()` 返回后、flush 前崩溃时允许 redelivery，不允许 offset 前进或消息缺失。pending ACK 只能保存 subscription epoch、delivery ID 与 wire size，MUST NOT 再持有 payload 副本。任何 reconnect/rebalance 都使旧 pending identity 失效，由 worker watermark 决定是否重投。
 
 官方顺序式 PHP driver 不维护消息 inbox，必须协商 `max_in_flight_messages=1`，并以零 initial credit 打开或恢复 subscription。首次 `next()` 使用 FlowControl 开窗；后续 `next()` 使用 pending ACK 携带精确 credit 原子开窗，因此 open、ACK 后的 `commit()` 都不会被未读取的 ConsumeMessage 超越。driver 必须记录唯一 outstanding delivery 或 pending ACK，重复 ACK/NACK、未 settle 就再次 `next()`、以及对 pending ACK 再次 settlement 必须在本地拒绝。wire protocol 仍允许大于 1 的窗口，但使用者必须自行实现同样受窗口约束的 interleaved delivery 存储与 control-response demultiplexing。
+
+协程 driver 通过 `ConcurrentConsumerClientInterface::consumeConcurrent()` 提供大于 1 的窗口：以请求值打开，worker 按自身上限协商（`ConcurrentConsumerStreamInterface::maxInFlightMessages()` 返回协商结果）；stream 同时最多持有窗口条未确认投递，ACK/NACK 可乱序，延迟 ACK 按确认顺序在下一个屏障逐条冲刷，`next()` 冲刷时每条 ACK 原子补充该投递的精确 credit，控制屏障冲刷时额度保留在本地。stream 仍不是并发安全的：所有调用必须由同一个协程发起，业务协程处理完成后把结果交回该协程统一确认。commit 期间到达的消息按到达顺序暂存，不超过窗口。阻塞 `Client` 只提供顺序窗口。
 
 credit 与内存 permit 的规则必须区分：
 
