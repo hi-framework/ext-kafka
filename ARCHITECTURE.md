@@ -696,6 +696,33 @@ NACK 表示当前 delivery 未成功。
 
 NACK 绝不能把该消息标记为已处理。
 
+### 13.5 指定起始位置（待实现）
+
+当前只支持 `auto.offset.reset`（earliest / latest），它只在分区没有可用的已提交 offset 时生效。
+一次性的回补或重放在运维侧用 `kafka-consumer-groups --reset-offsets` 修改已提交 offset 完成。
+
+禁止“subscribe 之后直接 seek”：seek 时分区可能尚未分配，随后的 rebalance 也会用已提交
+offset 覆盖位置。需要在代码中指定起始位置时，按以下方式实现：
+
+- ConsumeOpen 携带起始位置：按分区的 offset，或一个时间戳（worker 用 `offsets_for_times`
+  换算）；
+- worker 在 rebalance assign 回调中、分区**首次**分配给该 subscription 时，以起始位置 assign；
+  之后的 rebalance 照常从已提交 offset 继续，否则每次 rebalance 都会回退到起点；
+- 起始位置之前的 offset 不因此被提交，watermark 从起始位置开始；
+- framework 的 `ConsumeOffsetType::At` / `AfterMilli` 映射到该能力，并移除
+  `AbstractConsumer::assertSupportedOffsetMode()` 的限制。
+
+实现前需先确定：
+
+- 已有提交 offset 时，起始位置是覆盖它，还是只在没有提交 offset 时生效；
+- 起始位置对“首次分配”的判定范围：同一 subscription 生命周期内，还是跨进程重启（重启后
+  再次覆盖会造成重复消费）；
+- 按 offset 指定时，未列出的分区与扩容新增的分区如何处理；
+- 时间戳晚于分区最新消息时的行为（等同 latest）。
+
+e2e 至少覆盖：指定 offset 与时间戳、首次分配后发生 rebalance 不回退、cooperative 增量分配、
+新增分区。
+
 ## 14. Credit 与背压
 
 背压由显式 credit 驱动，不由“缓冲快满后再 drop”驱动。
